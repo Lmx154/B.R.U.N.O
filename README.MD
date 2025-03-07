@@ -1,11 +1,11 @@
-# LMX154-B.R.U.N.O Project README
+# B.R.U.N.O Project README
 
-The LMX154-B.R.U.N.O project is a telemetry system comprising three main components: the Navigation Computer (NAVC), the Flight Controller (FC), and the Ground Station. These components work together to collect, transmit, and display sensor data using a combination of UART and ESP-NOW communication protocols. This README provides detailed documentation for each component based on their respective code files: `navc.ino`, `fc.ino`, and `groundstation.ino`.
+The B.R.U.N.O project is a telemetry system comprising three main components: the Navigation Computer (NAVC), the Flight Controller (FC), and the Ground Station. These components work together to collect, transmit, and display sensor data using a combination of UART and ESP-NOW communication protocols. This README provides detailed documentation for each component based on their respective code files: `navc.ino`, `fc.ino`, and `groundstation.ino`.
 
 ## Directory Structure
 
 ```
-lmx154-b.r.u.n.o/
+bruno/
 ├── README.MD
 ├── fc/
 │   └── fc.ino
