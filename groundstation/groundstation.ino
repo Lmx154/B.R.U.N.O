@@ -1,151 +1,115 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <esp_now.h>
+#include <RadioLib.h>
 
-// MAC addresses
-uint8_t fcMacAddress[] = {0xE8, 0x06, 0x90, 0x95, 0xEE, 0xB0};    // FC MAC
-uint8_t groundStationMacAddress[] = {0x24, 0xEC, 0x4A, 0x2C, 0x4F, 0x38}; // Ground Station MAC
+// LoRa pins
+#define NSS   PA4
+#define DIO0  PA8
+#define NRST  PA9
+#define DIO1  PA10
+SX1276 radio = new Module(NSS, DIO0, NRST, DIO1);
 
-// Structure to send/receive data via ESP-NOW (reduced message size)
-typedef struct struct_message {
-    char message[240]; // Reduced to fit within ESP-NOW limit
-    int rssi;
-} struct_message;
+// Global flag for operation completion
+volatile bool operationDone = false;
 
-struct_message sendMessage;
-struct_message receivedMessage;
-
-esp_now_peer_info_t peerInfoFC;
-
-// Callback function executed when data is sent
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    Serial.print("Last Packet Send Status: ");
-    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
-}
-
-// Callback function executed when data is received
-void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len) {
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
-             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-    Serial.print("Received from MAC: ");
-    Serial.println(macStr);
-
-    if (len <= sizeof(receivedMessage)) {
-        memcpy(&receivedMessage, incomingData, sizeof(receivedMessage));
-        receivedMessage.message[sizeof(receivedMessage.message) - 1] = '\0';
-        Serial.println("Telemetry Data: " + String(receivedMessage.message) + ", rssi: " + String(receivedMessage.rssi));
-    }
-}
-
-// Base Communication class (interface)
+// Communication interface
 class Communication {
 public:
     virtual void send(const String& data) = 0;
     virtual String receive() = 0;
+    virtual void setup() = 0;
     virtual ~Communication() {}
 };
 
-// ESP-NOW communication
-class EspNowComm : public Communication {
+// LoRa communication class
+class LoraComm : public Communication {
+private:
+    String receivedData;
+    uint8_t groundStationAddress = 0xA1; // Ground Station address
+    uint8_t fcAddress = 0xA2;            // FC address
+
 public:
-    EspNowComm() {}
-
-    void setup() {
-        WiFi.mode(WIFI_STA);
-        Serial.print("This Board MAC Address: ");
-        Serial.println(WiFi.macAddress());
-        WiFi.setChannel(0); // Match the working example's channel
-        if (esp_now_init() != ESP_OK) {
-            Serial.println("Error initializing ESP-NOW");
-            return;
+    void setup() override {
+        int state = radio.begin(915.0);
+        if (state != RADIOLIB_ERR_NONE) {
+            Serial.print(F("Ground LoRa init failed, code "));
+            Serial.println(state);
+            while (true);
         }
-        esp_now_register_send_cb(OnDataSent);
-        esp_now_register_recv_cb(OnDataRecv);
-
-        // Register FC as a peer
-        memcpy(peerInfoFC.peer_addr, fcMacAddress, 6);
-        peerInfoFC.channel = 0;
-        peerInfoFC.encrypt = false;
-        if (esp_now_add_peer(&peerInfoFC) != ESP_OK) {
-            Serial.println("Failed to add FC peer");
-        } else {
-            Serial.println("FC peer added successfully");
-        }
+        // Match FC's LoRa settings
+        radio.setSpreadingFactor(7);
+        radio.setBandwidth(250.0);
+        radio.setCodingRate(5);
+        radio.setSyncWord(0xAB);
+        radio.setNodeAddress(groundStationAddress);
+        radio.setDio0Action([]() { operationDone = true; }, RISING);
+        radio.startReceive();
+        Serial.println(F("Ground LoRa initialized successfully"));
     }
 
     void send(const String& data) override {
-        if (data.length() >= sizeof(sendMessage.message)) {
-            Serial.println("Data too long for buffer, truncating");
-            strncpy(sendMessage.message, data.substring(0, sizeof(sendMessage.message) - 1).c_str(), sizeof(sendMessage.message));
+        String dataCopy = data; // Create a non-const copy
+        Serial.println("Ground sending: " + dataCopy);
+        int state = radio.startTransmit(dataCopy, fcAddress);
+        if (state != RADIOLIB_ERR_NONE) {
+            Serial.print(F("Ground LoRa send failed, code "));
+            Serial.println(state);
         } else {
-            strncpy(sendMessage.message, data.c_str(), sizeof(sendMessage.message));
-        }
-        sendMessage.message[sizeof(sendMessage.message) - 1] = '\0';
-        sendMessage.rssi = 0;
-        esp_err_t result = esp_now_send(fcMacAddress, (uint8_t *)&sendMessage, sizeof(sendMessage));
-        if (result != ESP_OK) {
-            Serial.println("ESP-NOW send failed, error code: " + String(result));
-        } else {
-            Serial.println("Sent: " + String(sendMessage.message));
+            Serial.println("Ground LoRa send initiated");
         }
     }
 
     String receive() override {
-        String data = String(receivedMessage.message);
-        receivedMessage.message[0] = '\0';
-        return data;
-    }
-
-    void sendCommand(const String& command) {
-        send(command);
-    }
-
-    String receiveCommand() {
-        return receive();
+        if (operationDone) {
+            operationDone = false;
+            int state = radio.readData(receivedData);
+            if (state == RADIOLIB_ERR_NONE) {
+                Serial.print("Ground LoRa received ");
+                Serial.print(receivedData.length());
+                Serial.println(" bytes");
+                Serial.println("Ground LoRa received: " + receivedData);
+                Serial.print("RSSI: ");
+                Serial.print(radio.getRSSI());
+                Serial.print(" dBm, SNR: ");
+                Serial.print(radio.getSNR());
+                Serial.println(" dB");
+                radio.startReceive();
+                return receivedData;
+            } else {
+                Serial.print(F("Ground LoRa read failed, code "));
+                Serial.println(state);
+                radio.startReceive();
+            }
+        }
+        return "";
     }
 };
 
-// Ground Station
+// Ground Station class
 class GroundStation {
 private:
-    Communication* comm;
+    LoraComm lora;
 
 public:
-    GroundStation(Communication* communication) : comm(communication) {}
-
     void setup() {
-        static_cast<EspNowComm*>(comm)->setup();
+        lora.setup();
     }
-
-    void receiveAndForward() {
-        // Data is handled in OnDataRecv callback
-    }
-
-    void sendCommand(const String& command) {
-        static_cast<EspNowComm*>(comm)->sendCommand(command);
+    void loop() {
+        String telemetry = lora.receive();
+        if (telemetry != "") {
+            Serial.println("Received telemetry: " + telemetry);
+        }
     }
 };
 
-// Global instances
-EspNowComm espNowComm;
-GroundStation groundStation(&espNowComm);
+// Global instance
+GroundStation groundStation;
 
 void setup() {
     Serial.begin(115200);
-    delay(1000);
-    Serial.println("Ground Station Started");
     groundStation.setup();
 }
 
 void loop() {
-    if (Serial.available() > 0) {
-        String command = Serial.readStringUntil('\n');
-        command.trim();
-        if (command.startsWith("SET ACTION")) {
-            groundStation.sendCommand(command);
-        }
-    }
-    delay(100);
+    groundStation.loop();
+    delay(20); // Check for packets every 20ms
 }
