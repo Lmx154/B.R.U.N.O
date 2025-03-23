@@ -83,7 +83,6 @@ private:
   uint32_t id = 1;
   unsigned long lastSendTime = 0; // For autonomous sending
   unsigned long lastCollectionTime = 0; // For synchronized data collection
-  String cachedData; // Cache the latest sensor data
 
   String collectData() {
     // Read all sensors at once
@@ -93,62 +92,54 @@ private:
     float pressure = bmp.readPressure() / 100.0F;
     float altitude = bmp.readAltitude(SEALEVELPRESSURE_HPA);
 
-    // IMU data (accel and gyro)
-    String IMU = String(accel.getAccelX_mss(), 2) + "," + 
-                 String(accel.getAccelY_mss(), 2) + "," + 
-                 String(accel.getAccelZ_mss(), 2) + "," + 
-                 String(round(gyro.getGyroX_rads() * (180.0 / PI))) + "," + 
-                 String(round(gyro.getGyroY_rads() * (180.0 / PI))) + "," + 
-                 String(round(gyro.getGyroZ_rads() * (180.0 / PI)));
+    // IMU data (accel and gyro) - 6 values
+    String packet = String(accel.getAccelX_mss(), 2) + "," + 
+                    String(accel.getAccelY_mss(), 2) + "," + 
+                    String(accel.getAccelZ_mss(), 2) + "," + 
+                    String(round(gyro.getGyroX_rads() * (180.0 / PI))) + "," + 
+                    String(round(gyro.getGyroY_rads() * (180.0 / PI))) + "," + 
+                    String(round(gyro.getGyroZ_rads() * (180.0 / PI))) + ",";
 
-    // BME data (temp, pressure, altitude)
-    String BME = String(temp, 2) + "," + String(pressure, 2) + "," + String(altitude, 2);
+    // BME data (temp, pressure, altitude) - 3 values
+    packet += String(temp, 2) + "," + String(pressure, 2) + "," + String(altitude, 2) + ",";
 
-    // Magnetometer (placeholder, zeros since not used)
-    String MAG = "0.0,0.0,0.0";
+    // Magnetometer (placeholder, zeros) - 3 values
+    packet += "0.0,0.0,0.0,";
 
-    // GPS data (use last known values if no recent update)
-    String GPSVal = lastLat + "," + lastLon + "," + String(satellites) + "," + lastAltitude;
+    // GPS data (use last known values) - 4 values
+    packet += lastLat + "," + lastLon + "," + String(satellites) + "," + lastAltitude;
 
-    // Combine into final packet (no duplicates)
-    String Packet = IMU + "," + BME + "," + MAG + "," + GPSVal;
-    if (Packet.length() > 255) {
-      Packet = Packet.substring(0, 255); // Truncate if too long
+    if (packet.length() > 255) {
+      packet = packet.substring(0, 255); // Truncate if too long
     }
-    return Packet;
+    return packet;
   }
 
 public:
   void processRequest() {
     unsigned long currentTime = millis();
 
-    // Collect data every 500ms to align with typical GPS update rates
-    if (currentTime - lastCollectionTime >= 500) {
-      cachedData = collectData();
-      lastCollectionTime = currentTime;
-    }
-
-    // Send data every 500ms autonomously
-    if (currentTime - lastSendTime >= 500) {
+    // Send data every 500ms autonomously or on request
+    if (currentTime - lastSendTime >= 500 || SerialNavc.available() > 0) {
+      String packet = collectData(); // Generate fresh packet each time
       digitalWrite(LED_PIN, HIGH);
-      Serial.println("NAVC sending: " + cachedData);
-      SerialNavc.println(cachedData);
+      Serial.println("NAVC sending: " + packet);
+      SerialNavc.println(packet); // Send to FC
       delay(10); // Small delay to ensure transmission
       digitalWrite(LED_PIN, LOW);
       lastSendTime = currentTime;
-    }
 
-    // Handle incoming requests from FC
-    if (SerialNavc.available() > 0) {
-      String request = SerialNavc.readStringUntil('\n');
-      request.trim();
-      Serial.println("NAVC received: " + request);
-      if (request == "REQUEST_DATA") {
-        digitalWrite(LED_PIN, HIGH);
-        Serial.println("NAVC sending: " + cachedData);
-        SerialNavc.println(cachedData);
-        delay(10);
-        digitalWrite(LED_PIN, LOW);
+      // Handle incoming requests from FC
+      if (SerialNavc.available() > 0) {
+        String request = SerialNavc.readStringUntil('\n');
+        request.trim();
+        Serial.println("NAVC received: " + request);
+        if (request == "REQUEST_DATA") {
+          Serial.println("NAVC responding: " + packet);
+          SerialNavc.println(packet); // Send again for immediate response
+        }
+        // Clear SerialNavc buffer to prevent stale data
+        while (SerialNavc.available() > 0) SerialNavc.read();
       }
     }
   }
@@ -165,13 +156,11 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
   Serial.println("Starting NMEA parsing and NAVC on STM32F4 Black Pill...");
 
-  // Initialize I2C
   Wire.setSCL(PB8);
   Wire.setSDA(PB9);
   Wire.begin();
   Wire.setClock(100000); // 100kHz
 
-  // Initialize BMP280
   if (!bmp.begin(0x76)) {
     Serial.println("BMP280 init failed!");
     while (1) delay(10);
@@ -182,14 +171,12 @@ void setup() {
                   Adafruit_BMP280::FILTER_X16,
                   Adafruit_BMP280::STANDBY_MS_500);
 
-  // Initialize BMI088 Accelerometer
   int status = accel.begin();
   if (status < 0) {
     Serial.println("Accel init failed!");
     while (1) delay(10);
   }
 
-  // Initialize BMI088 Gyroscope
   status = gyro.begin();
   if (status < 0) {
     Serial.println("Gyro init failed!");
@@ -198,7 +185,6 @@ void setup() {
 }
 
 void loop() {
-  // Parse GPS data from Serial1
   while (Serial1.available()) {
     char c = Serial1.read();
     if (c == '$') {
@@ -212,6 +198,5 @@ void loop() {
     }
   }
 
-  // Handle NAVC requests and autonomous sending
   navc.processRequest();
 }

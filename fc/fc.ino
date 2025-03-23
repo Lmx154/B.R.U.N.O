@@ -30,6 +30,8 @@ public:
         if (Serial2.available() > 0) {
             String data = Serial2.readStringUntil('\n');
             data.trim();
+            Serial.println("FC received from NAVC: " + data); // Debug
+            while (Serial2.available() > 0) Serial2.read(); // Clear buffer
             return data;
         }
         return "";
@@ -57,6 +59,7 @@ public:
     void setup() override {
         int state = radio.begin(915.0);
         if (state != RADIOLIB_ERR_NONE) {
+            Serial.println("LoRa init failed!");
             while (true);
         }
         radio.setSpreadingFactor(7);
@@ -73,13 +76,15 @@ public:
         String packet = getTimestamp() + " " + dataCopy;
         Serial.println(packet); // Single timestamp per packet
         operationDone = false;
-        int state = radio.startTransmit(dataCopy, groundStationAddress); // Send raw data
+        int state = radio.startTransmit(dataCopy, groundStationAddress);
         if (state == RADIOLIB_ERR_NONE) {
             unsigned long startTime = millis();
             while (!operationDone && millis() - startTime < 1000) {
                 delay(1);
             }
             radio.finishTransmit();
+        } else {
+            Serial.println("Transmit failed: " + String(state));
         }
         radio.startReceive();
     }
@@ -119,7 +124,7 @@ public:
         uart.requestData();
         String navcData = uart.receiveData();
         if (navcData != "") {
-            lora.send(navcData); // Send directly without buffering
+            lora.send(navcData);
         }
 
         String command = lora.receive();
