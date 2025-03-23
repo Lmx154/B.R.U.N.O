@@ -39,8 +39,10 @@ private:
 
 public:
     void setup() override {
+        Serial.println("Initializing LoRa...");
         int state = radio.begin(915.0);
         if (state != RADIOLIB_ERR_NONE) {
+            Serial.println("LoRa init failed: " + String(state));
             while (true);
         }
         radio.setSpreadingFactor(7);
@@ -50,20 +52,23 @@ public:
         radio.setNodeAddress(groundStationAddress);
         radio.setDio0Action([]() { operationDone = true; }, RISING);
         radio.startReceive();
+        Serial.println("LoRa initialized, address: " + String(groundStationAddress));
     }
 
     void send(const String& data) override {
         String dataCopy = data;
         String packet = getTimestamp() + " " + dataCopy;
-        Serial.println(packet); // Output with timestamp
+        Serial.println("GS sending: " + packet);
         operationDone = false;
-        int state = radio.startTransmit(dataCopy, fcAddress); // Send raw data
+        int state = radio.startTransmit(dataCopy, fcAddress);
         if (state == RADIOLIB_ERR_NONE) {
             unsigned long startTime = millis();
             while (!operationDone && millis() - startTime < 1000) {
                 delay(1);
             }
             radio.finishTransmit();
+        } else {
+            Serial.println("Transmit failed: " + String(state));
         }
         radio.startReceive();
     }
@@ -74,9 +79,11 @@ public:
             int state = radio.readData(receivedData);
             if (state == RADIOLIB_ERR_NONE) {
                 String packet = getTimestamp() + " " + receivedData;
-                Serial.println(packet); // Output with timestamp
+                Serial.println(packet);
                 radio.startReceive();
                 return receivedData;
+            } else {
+                Serial.println("Receive failed: " + String(state));
             }
             radio.startReceive();
         }
@@ -96,7 +103,10 @@ public:
     void loop() {
         String message = lora.receive();
         if (message != "") {
-            // Process silently
+            // Process silently unless it's an ACK/ERR
+            if (message == "BUZZER_ON_ACK" || message == "BUZZER_ON_ERR") {
+                Serial.println("GS received: " + message);
+            }
         }
 
         if (Serial.available() > 0) {
@@ -119,5 +129,5 @@ void setup() {
 
 void loop() {
     groundStation.loop();
-    delay(20);
+    delay(10); // Reduced delay for faster response
 }

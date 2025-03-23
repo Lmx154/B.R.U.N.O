@@ -82,65 +82,58 @@ class NAVC {
 private:
   uint32_t id = 1;
   unsigned long lastSendTime = 0; // For autonomous sending
-  unsigned long lastCollectionTime = 0; // For synchronized data collection
 
   String collectData() {
-    // Read all sensors at once
     accel.readSensor();
     gyro.readSensor();
     float temp = bmp.readTemperature();
     float pressure = bmp.readPressure() / 100.0F;
     float altitude = bmp.readAltitude(SEALEVELPRESSURE_HPA);
 
-    // IMU data (accel and gyro) - 6 values
     String packet = String(accel.getAccelX_mss(), 2) + "," + 
                     String(accel.getAccelY_mss(), 2) + "," + 
                     String(accel.getAccelZ_mss(), 2) + "," + 
                     String(round(gyro.getGyroX_rads() * (180.0 / PI))) + "," + 
                     String(round(gyro.getGyroY_rads() * (180.0 / PI))) + "," + 
-                    String(round(gyro.getGyroZ_rads() * (180.0 / PI))) + ",";
-
-    // BME data (temp, pressure, altitude) - 3 values
-    packet += String(temp, 2) + "," + String(pressure, 2) + "," + String(altitude, 2) + ",";
-
-    // Magnetometer (placeholder, zeros) - 3 values
-    packet += "0.0,0.0,0.0,";
-
-    // GPS data (use last known values) - 4 values
-    packet += lastLat + "," + lastLon + "," + String(satellites) + "," + lastAltitude;
+                    String(round(gyro.getGyroZ_rads() * (180.0 / PI))) + "," +
+                    String(temp, 2) + "," + String(pressure, 2) + "," + String(altitude, 2) + "," +
+                    "0.0,0.0,0.0," + lastLat + "," + lastLon + "," + String(satellites) + "," + lastAltitude;
 
     if (packet.length() > 255) {
-      packet = packet.substring(0, 255); // Truncate if too long
+      packet = packet.substring(0, 255);
     }
     return packet;
+  }
+
+  void sendPacket(const String& packet) {
+    digitalWrite(LED_PIN, HIGH);
+    Serial.println("NAVC sending: " + packet);
+    SerialNavc.println(packet);
+    delay(10); // Ensure transmission
+    digitalWrite(LED_PIN, LOW);
   }
 
 public:
   void processRequest() {
     unsigned long currentTime = millis();
 
-    // Send data every 500ms autonomously or on request
-    if (currentTime - lastSendTime >= 500 || SerialNavc.available() > 0) {
-      String packet = collectData(); // Generate fresh packet each time
-      digitalWrite(LED_PIN, HIGH);
-      Serial.println("NAVC sending: " + packet);
-      SerialNavc.println(packet); // Send to FC
-      delay(10); // Small delay to ensure transmission
-      digitalWrite(LED_PIN, LOW);
-      lastSendTime = currentTime;
-
-      // Handle incoming requests from FC
-      if (SerialNavc.available() > 0) {
-        String request = SerialNavc.readStringUntil('\n');
-        request.trim();
-        Serial.println("NAVC received: " + request);
-        if (request == "REQUEST_DATA") {
-          Serial.println("NAVC responding: " + packet);
-          SerialNavc.println(packet); // Send again for immediate response
-        }
-        // Clear SerialNavc buffer to prevent stale data
-        while (SerialNavc.available() > 0) SerialNavc.read();
+    // Check for incoming request first
+    if (SerialNavc.available() > 0) {
+      String request = SerialNavc.readStringUntil('\n');
+      request.trim();
+      Serial.println("NAVC received: " + request);
+      if (request == "REQUEST_DATA") {
+        String packet = collectData();
+        sendPacket(packet);
+        lastSendTime = currentTime; // Reset timer to avoid immediate autonomous send
       }
+      while (SerialNavc.available() > 0) SerialNavc.read(); // Clear buffer
+    }
+    // Autonomous send only if no request was processed and 500ms has passed
+    else if (currentTime - lastSendTime >= 500) {
+      String packet = collectData();
+      sendPacket(packet);
+      lastSendTime = currentTime;
     }
   }
 };
