@@ -25,13 +25,11 @@ class UartComm {
 public:
     void requestData() {
         Serial2.println("REQUEST_DATA");
-        Serial.println("FC sent: REQUEST_DATA to NAVC");
     }
     String receiveData() {
         if (Serial2.available() > 0) {
             String data = Serial2.readStringUntil('\n');
             data.trim();
-            Serial.println("FC received from NAVC: " + data);
             return data;
         }
         return "";
@@ -45,12 +43,20 @@ private:
     uint8_t fcAddress = 0xA2;            // FC address
     uint8_t groundStationAddress = 0xA1; // Ground Station address
 
+    String getTimestamp() {
+        unsigned long currentTime = millis();
+        int seconds = (currentTime / 1000) % 60;
+        int minutes = (currentTime / 60000) % 60;
+        int hours = (currentTime / 3600000) % 24;
+        return String("[2025/03/22 ") + (hours < 10 ? "0" : "") + hours + ":" +
+               (minutes < 10 ? "0" : "") + minutes + ":" + 
+               (seconds < 10 ? "0" : "") + seconds + "]";
+    }
+
 public:
     void setup() override {
         int state = radio.begin(915.0);
         if (state != RADIOLIB_ERR_NONE) {
-            Serial.print(F("FC LoRa init failed, code "));
-            Serial.println(state);
             while (true);
         }
         radio.setSpreadingFactor(7);
@@ -60,22 +66,22 @@ public:
         radio.setNodeAddress(fcAddress);
         radio.setDio0Action([]() { operationDone = true; }, RISING);
         radio.startReceive();
-        Serial.println(F("FC LoRa initialized successfully"));
     }
 
     void send(const String& data) override {
         String dataCopy = data;
-        Serial.print("FC sending to ground station: ");
-        Serial.print(dataCopy.length());
-        Serial.println(" bytes");
-        Serial.println(dataCopy);
-        int state = radio.startTransmit(dataCopy, groundStationAddress);
-        if (state != RADIOLIB_ERR_NONE) {
-            Serial.print(F("FC LoRa send failed, code "));
-            Serial.println(state);
-        } else {
-            Serial.println("FC LoRa send initiated");
+        String packet = getTimestamp() + " " + dataCopy;
+        Serial.println(packet); // Single timestamp per packet
+        operationDone = false;
+        int state = radio.startTransmit(dataCopy, groundStationAddress); // Send raw data
+        if (state == RADIOLIB_ERR_NONE) {
+            unsigned long startTime = millis();
+            while (!operationDone && millis() - startTime < 1000) {
+                delay(1);
+            }
+            radio.finishTransmit();
         }
+        radio.startReceive();
     }
 
     String receive() override {
@@ -83,7 +89,8 @@ public:
             operationDone = false;
             int state = radio.readData(receivedData);
             if (state == RADIOLIB_ERR_NONE) {
-                Serial.println("FC LoRa received: " + receivedData);
+                String packet = getTimestamp() + " " + receivedData;
+                Serial.println(packet);
                 radio.startReceive();
                 return receivedData;
             }
@@ -98,14 +105,12 @@ class FC {
 private:
     UartComm uart;
     LoraComm lora;
-    // **Added for buzzer control**
     bool buzzerActive = false;
     unsigned long buzzerStartTime = 0;
 
 public:
     void setup() {
         lora.setup();
-        // **Initialize buzzer pin**
         pinMode(PB13, OUTPUT);
         digitalWrite(PB13, LOW);
     }
@@ -114,25 +119,13 @@ public:
         uart.requestData();
         String navcData = uart.receiveData();
         if (navcData != "") {
-            lora.send(navcData);
-            unsigned long startTime = millis();
-            while (!operationDone && millis() - startTime < 500) {
-                delay(1);
-            }
-            if (!operationDone) {
-                Serial.println("Transmission timeout - resetting LoRa");
-                radio.startReceive();
-            }
-            operationDone = false;
+            lora.send(navcData); // Send directly without buffering
         }
 
-        // **Process incoming LoRa commands**
         String command = lora.receive();
         if (command != "") {
             if (command == "BUZZER_ON") {
-                // Attempt to activate buzzer
                 digitalWrite(PB13, HIGH);
-                // Verify if pin is high (basic error check)
                 if (digitalRead(PB13) == HIGH) {
                     buzzerStartTime = millis();
                     buzzerActive = true;
@@ -140,22 +133,9 @@ public:
                 } else {
                     lora.send("BUZZER_ON_ERR");
                 }
-                // Wait for transmission completion
-                unsigned long ackStartTime = millis();
-                while (!operationDone && millis() - ackStartTime < 500) {
-                    delay(1);
-                }
-                if (!operationDone) {
-                    Serial.println("ACK/ERR transmission timeout - resetting LoRa");
-                    radio.startReceive();
-                }
-                operationDone = false;
-            } else {
-                Serial.println("Unknown command: " + command);
             }
         }
 
-        // **Turn off buzzer after 2 seconds**
         if (buzzerActive && millis() - buzzerStartTime >= 2000) {
             digitalWrite(PB13, LOW);
             buzzerActive = false;
@@ -174,5 +154,5 @@ void setup() {
 
 void loop() {
     fc.loop();
-    delay(50); // Request data every 50ms for faster telemetry
+    delay(50);
 }

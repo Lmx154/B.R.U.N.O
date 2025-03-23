@@ -27,12 +27,20 @@ private:
     uint8_t groundStationAddress = 0xA1; // Ground Station address
     uint8_t fcAddress = 0xA2;            // FC address
 
+    String getTimestamp() {
+        unsigned long currentTime = millis();
+        int seconds = (currentTime / 1000) % 60;
+        int minutes = (currentTime / 60000) % 60;
+        int hours = (currentTime / 3600000) % 24;
+        return String("[2025/03/22 ") + (hours < 10 ? "0" : "") + hours + ":" +
+               (minutes < 10 ? "0" : "") + minutes + ":" + 
+               (seconds < 10 ? "0" : "") + seconds + "]";
+    }
+
 public:
     void setup() override {
         int state = radio.begin(915.0);
         if (state != RADIOLIB_ERR_NONE) {
-            Serial.print(F("Ground LoRa init failed, code "));
-            Serial.println(state);
             while (true);
         }
         radio.setSpreadingFactor(7);
@@ -42,19 +50,22 @@ public:
         radio.setNodeAddress(groundStationAddress);
         radio.setDio0Action([]() { operationDone = true; }, RISING);
         radio.startReceive();
-        Serial.println(F("Ground LoRa initialized successfully"));
     }
 
     void send(const String& data) override {
         String dataCopy = data;
-        Serial.println("Ground sending: " + dataCopy);
-        int state = radio.startTransmit(dataCopy, fcAddress);
-        if (state != RADIOLIB_ERR_NONE) {
-            Serial.print(F("Ground LoRa send failed, code "));
-            Serial.println(state);
-        } else {
-            Serial.println("Ground LoRa send initiated");
+        String packet = getTimestamp() + " " + dataCopy;
+        Serial.println(packet); // Output with timestamp
+        operationDone = false;
+        int state = radio.startTransmit(dataCopy, fcAddress); // Send raw data
+        if (state == RADIOLIB_ERR_NONE) {
+            unsigned long startTime = millis();
+            while (!operationDone && millis() - startTime < 1000) {
+                delay(1);
+            }
+            radio.finishTransmit();
         }
+        radio.startReceive();
     }
 
     String receive() override {
@@ -62,22 +73,12 @@ public:
             operationDone = false;
             int state = radio.readData(receivedData);
             if (state == RADIOLIB_ERR_NONE) {
-                Serial.print("Ground LoRa received ");
-                Serial.print(receivedData.length());
-                Serial.println(" bytes");
-                Serial.println("Ground LoRa received: " + receivedData);
-                Serial.print("RSSI: ");
-                Serial.print(radio.getRSSI());
-                Serial.print(" dBm, SNR: ");
-                Serial.print(radio.getSNR());
-                Serial.println(" dB");
+                String packet = getTimestamp() + " " + receivedData;
+                Serial.println(packet); // Output with timestamp
                 radio.startReceive();
                 return receivedData;
-            } else {
-                Serial.print(F("Ground LoRa read failed, code "));
-                Serial.println(state);
-                radio.startReceive();
             }
+            radio.startReceive();
         }
         return "";
     }
@@ -93,21 +94,11 @@ public:
         lora.setup();
     }
     void loop() {
-        // **Receive and process messages from FC**
         String message = lora.receive();
         if (message != "") {
-            if (message.startsWith("[")) { // Telemetry starts with "["
-                Serial.println("Received telemetry: " + message);
-            } else if (message == "BUZZER_ON_ACK") {
-                Serial.println("Buzzer command acknowledged");
-            } else if (message == "BUZZER_ON_ERR") {
-                Serial.println("Buzzer command failed");
-            } else {
-                Serial.println("Received unknown message: " + message);
-            }
+            // Process silently
         }
 
-        // **Send command from software via serial input**
         if (Serial.available() > 0) {
             String input = Serial.readStringUntil('\n');
             input.trim();
@@ -128,5 +119,5 @@ void setup() {
 
 void loop() {
     groundStation.loop();
-    delay(20); // Check for packets every 20ms
+    delay(20);
 }

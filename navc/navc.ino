@@ -77,183 +77,77 @@ void parseGNGGA(String sentence) {
   }
 }
 
-// Base Sensor class
-class Sensor {
-public:
-  virtual String read() = 0;
-  virtual ~Sensor() {}
-};
-
-// Real sensor classes
-class RealAccelerometer : public Sensor {
-public:
-  String read() override {
-    accel.readSensor();
-    float acc_x = accel.getAccelX_mss();
-    float acc_y = accel.getAccelY_mss();
-    float acc_z = accel.getAccelZ_mss();
-    // No velocity data from BMI088, so zero out
-    return String(acc_x, 1) + "|" + String(acc_y, 1) + "|" + String(acc_z, 1) + "|0.0|0.0|0.0";
-  }
-};
-
-class RealGyroscope : public Sensor {
-public:
-  String read() override {
-    gyro.readSensor();
-    // Convert radians/sec to degrees/sec (common in flight controllers)
-    float gyro_x = gyro.getGyroX_rads() * (180.0 / PI);
-    float gyro_y = gyro.getGyroY_rads() * (180.0 / PI);
-    float gyro_z = gyro.getGyroZ_rads() * (180.0 / PI);
-    return String(gyro_x, 1) + "|" + String(gyro_y, 1) + "|" + String(gyro_z, 1);
-  }
-};
-
-class RealMagnetometer : public Sensor {
-public:
-  String read() override {
-    // Magnetometer not used, return zeros
-    return "0.0|0.0|0.0";
-  }
-};
-
-class RealBarometer : public Sensor {
-public:
-  String read() override {
-    float pressure = bmp.readPressure() / 100.0F; // hPa
-    float altitude = bmp.readAltitude(SEALEVELPRESSURE_HPA);
-    return String(pressure, 2) + "|" + String(altitude, 1);
-  }
-};
-
-class RealPressureSensor : public Sensor {
-public:
-  String read() override {
-    float pressure = bmp.readPressure() / 100.0F; // hPa
-    return String(pressure, 2);
-  }
-};
-
-class RealGPS : public Sensor {
-public:
-  String read() override {
-    if (!hasFix) {
-      return "0|0|0|0";
-    }
-    return lastLat + "|" + lastLon + "|" + String(satellites) + "|" + lastAltitude;
-  }
-};
-
-class RealTempSensor : public Sensor {
-public:
-  String read() override {
-    // Use BMP280 temperature (more accurate for environmental sensing)
-    float temp = bmp.readTemperature();
-    return String(temp, 1);
-  }
-};
-
 // NAVC class
 class NAVC {
 private:
-  Sensor* accelerometer;
-  Sensor* gyroscope;
-  Sensor* magnetometer;
-  Sensor* barometer;
-  Sensor* pressureSensor;
-  Sensor* gps;
-  Sensor* tempSensor;
   uint32_t id = 1;
-  unsigned long lastSendTime = 0; // Added for autonomous sending
-
-public:
-  NAVC() {
-    accelerometer = new RealAccelerometer();
-    gyroscope = new RealGyroscope();
-    magnetometer = new RealMagnetometer();
-    barometer = new RealBarometer();
-    pressureSensor = new RealPressureSensor();
-    gps = new RealGPS();
-    tempSensor = new RealTempSensor();
-  }
-
-  ~NAVC() {
-    delete accelerometer;
-    delete gyroscope;
-    delete magnetometer;
-    delete barometer;
-    delete pressureSensor;
-    delete gps;
-    delete tempSensor;
-  }
+  unsigned long lastSendTime = 0; // For autonomous sending
+  unsigned long lastCollectionTime = 0; // For synchronized data collection
+  String cachedData; // Cache the latest sensor data
 
   String collectData() {
-    // Get current time (using millis-based mission time since no RTC is present)
-    unsigned long currentTime = millis();
-    uint32_t secondsTotal = currentTime / 1000;
-    uint32_t hours = secondsTotal / 3600;
-    uint32_t minutes = (secondsTotal % 3600) / 60;
-    uint32_t seconds = secondsTotal % 60;
-    // Fake date since no RTC; using a fixed date for format consistency
-    String dateStamp = "[2025/03/22 " + String(hours) + ":" + String(minutes) + ":" + String(seconds) + "]";
-
-    // IMU data (accel and gyro)
+    // Read all sensors at once
     accel.readSensor();
     gyro.readSensor();
-    String IMU = String(accel.getAccelX_mss()) + "," + String(accel.getAccelY_mss()) + "," + 
-                 String(accel.getAccelZ_mss()) + "," + 
+    float temp = bmp.readTemperature();
+    float pressure = bmp.readPressure() / 100.0F;
+    float altitude = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+
+    // IMU data (accel and gyro)
+    String IMU = String(accel.getAccelX_mss(), 2) + "," + 
+                 String(accel.getAccelY_mss(), 2) + "," + 
+                 String(accel.getAccelZ_mss(), 2) + "," + 
                  String(round(gyro.getGyroX_rads() * (180.0 / PI))) + "," + 
                  String(round(gyro.getGyroY_rads() * (180.0 / PI))) + "," + 
-                 String(round(gyro.getGyroZ_rads() * (180.0 / PI))) + "," + 
-                 String(bmp.readTemperature()); // Using BMP280 temp as accel temp substitute
+                 String(round(gyro.getGyroZ_rads() * (180.0 / PI)));
 
-    // BME data (barometer)
-    String BME = String(bmp.readTemperature()) + "," + 
-                 String(bmp.readPressure() / 100.0F) + "," + 
-                 String(bmp.readAltitude(SEALEVELPRESSURE_HPA)) + "," + 
-                 "0.0"; // No humidity sensor, so using 0.0
+    // BME data (temp, pressure, altitude)
+    String BME = String(temp, 2) + "," + String(pressure, 2) + "," + String(altitude, 2);
 
-    // GPS data
-    String GPSVal = String(hasFix) + "," + 
-                    String(hasFix ? 1 : 0) + "," + // Assuming quality 1 if fix, 0 if not
-                    lastLat + "," + 
-                    lastLon + "," + 
-                    "0.0" + "," + // No speed data available
-                    lastAltitude + "," + 
-                    String(satellites);
+    // Magnetometer (placeholder, zeros since not used)
+    String MAG = "0.0,0.0,0.0";
 
-    // Combine into final packet
-    String Packet = dateStamp + " " + IMU + "," + BME + "," + GPSVal;
+    // GPS data (use last known values if no recent update)
+    String GPSVal = lastLat + "," + lastLon + "," + String(satellites) + "," + lastAltitude;
+
+    // Combine into final packet (no duplicates)
+    String Packet = IMU + "," + BME + "," + MAG + "," + GPSVal;
     if (Packet.length() > 255) {
-      Packet = Packet.substring(0, 255);
+      Packet = Packet.substring(0, 255); // Truncate if too long
     }
     return Packet;
   }
 
+public:
   void processRequest() {
     unsigned long currentTime = millis();
-    // Send data every 100ms autonomously
-    if (currentTime - lastSendTime >= 100) {
-      String sensorData = collectData();
+
+    // Collect data every 500ms to align with typical GPS update rates
+    if (currentTime - lastCollectionTime >= 500) {
+      cachedData = collectData();
+      lastCollectionTime = currentTime;
+    }
+
+    // Send data every 500ms autonomously
+    if (currentTime - lastSendTime >= 500) {
       digitalWrite(LED_PIN, HIGH);
-      Serial.println("NAVC sending: " + sensorData);
-      SerialNavc.println(sensorData);
+      Serial.println("NAVC sending: " + cachedData);
+      SerialNavc.println(cachedData);
       delay(10); // Small delay to ensure transmission
       digitalWrite(LED_PIN, LOW);
       lastSendTime = currentTime;
     }
 
-    // Still handle incoming requests if desired
+    // Handle incoming requests from FC
     if (SerialNavc.available() > 0) {
       String request = SerialNavc.readStringUntil('\n');
       request.trim();
       Serial.println("NAVC received: " + request);
       if (request == "REQUEST_DATA") {
-        String sensorData = collectData();
         digitalWrite(LED_PIN, HIGH);
-        Serial.println("NAVC sending: " + sensorData);
-        SerialNavc.println(sensorData);
-        delay(10); // Small delay to ensure transmission
+        Serial.println("NAVC sending: " + cachedData);
+        SerialNavc.println(cachedData);
+        delay(10);
         digitalWrite(LED_PIN, LOW);
       }
     }
@@ -265,9 +159,8 @@ NAVC navc;
 
 void setup() {
   Serial.begin(115200);
-  // Removed: while (!Serial) delay(10); // Allow code to run without Serial Monitor
-  Serial1.begin(9600);
-  SerialNavc.begin(115200);
+  Serial1.begin(9600); // GPS
+  SerialNavc.begin(115200); // NAVC-to-FC
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   Serial.println("Starting NMEA parsing and NAVC on STM32F4 Black Pill...");
@@ -276,7 +169,7 @@ void setup() {
   Wire.setSCL(PB8);
   Wire.setSDA(PB9);
   Wire.begin();
-  Wire.setClock(100000); // 100kHz, compatible with both sensors
+  Wire.setClock(100000); // 100kHz
 
   // Initialize BMP280
   if (!bmp.begin(0x76)) {
