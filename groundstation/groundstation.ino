@@ -35,7 +35,6 @@ public:
             Serial.println(state);
             while (true);
         }
-        // Match FC's LoRa settings
         radio.setSpreadingFactor(7);
         radio.setBandwidth(250.0);
         radio.setCodingRate(5);
@@ -47,7 +46,7 @@ public:
     }
 
     void send(const String& data) override {
-        String dataCopy = data; // Create a non-const copy
+        String dataCopy = data;
         Serial.println("Ground sending: " + dataCopy);
         int state = radio.startTransmit(dataCopy, fcAddress);
         if (state != RADIOLIB_ERR_NONE) {
@@ -94,9 +93,27 @@ public:
         lora.setup();
     }
     void loop() {
-        String telemetry = lora.receive();
-        if (telemetry != "") {
-            Serial.println("Received telemetry: " + telemetry);
+        // **Receive and process messages from FC**
+        String message = lora.receive();
+        if (message != "") {
+            if (message.startsWith("[")) { // Telemetry starts with "["
+                Serial.println("Received telemetry: " + message);
+            } else if (message == "BUZZER_ON_ACK") {
+                Serial.println("Buzzer command acknowledged");
+            } else if (message == "BUZZER_ON_ERR") {
+                Serial.println("Buzzer command failed");
+            } else {
+                Serial.println("Received unknown message: " + message);
+            }
+        }
+
+        // **Send command from software via serial input**
+        if (Serial.available() > 0) {
+            String input = Serial.readStringUntil('\n');
+            input.trim();
+            if (input == "BUZZER_ON") {
+                lora.send("BUZZER_ON");
+            }
         }
     }
 };

@@ -53,10 +53,9 @@ public:
             Serial.println(state);
             while (true);
         }
-        // Optimize LoRa for speed
-        radio.setSpreadingFactor(7);  // Lower SF for faster transmission
-        radio.setBandwidth(250.0);    // Higher bandwidth for speed
-        radio.setCodingRate(5);       // Minimal error correction for speed
+        radio.setSpreadingFactor(7);
+        radio.setBandwidth(250.0);
+        radio.setCodingRate(5);
         radio.setSyncWord(0xAB);
         radio.setNodeAddress(fcAddress);
         radio.setDio0Action([]() { operationDone = true; }, RISING);
@@ -99,28 +98,68 @@ class FC {
 private:
     UartComm uart;
     LoraComm lora;
+    // **Added for buzzer control**
+    bool buzzerActive = false;
+    unsigned long buzzerStartTime = 0;
 
 public:
     void setup() {
         lora.setup();
+        // **Initialize buzzer pin**
+        pinMode(PB13, OUTPUT);
+        digitalWrite(PB13, LOW);
     }
+
     void loop() {
         uart.requestData();
         String navcData = uart.receiveData();
         if (navcData != "") {
             lora.send(navcData);
-            // Wait for transmission with timeout
             unsigned long startTime = millis();
-            while (!operationDone && millis() - startTime < 500) { // 500ms timeout
+            while (!operationDone && millis() - startTime < 500) {
                 delay(1);
             }
             if (!operationDone) {
                 Serial.println("Transmission timeout - resetting LoRa");
-                radio.startReceive(); // Reset LoRa state
+                radio.startReceive();
             }
             operationDone = false;
         }
-        lora.receive(); // Check for commands (if any)
+
+        // **Process incoming LoRa commands**
+        String command = lora.receive();
+        if (command != "") {
+            if (command == "BUZZER_ON") {
+                // Attempt to activate buzzer
+                digitalWrite(PB13, HIGH);
+                // Verify if pin is high (basic error check)
+                if (digitalRead(PB13) == HIGH) {
+                    buzzerStartTime = millis();
+                    buzzerActive = true;
+                    lora.send("BUZZER_ON_ACK");
+                } else {
+                    lora.send("BUZZER_ON_ERR");
+                }
+                // Wait for transmission completion
+                unsigned long ackStartTime = millis();
+                while (!operationDone && millis() - ackStartTime < 500) {
+                    delay(1);
+                }
+                if (!operationDone) {
+                    Serial.println("ACK/ERR transmission timeout - resetting LoRa");
+                    radio.startReceive();
+                }
+                operationDone = false;
+            } else {
+                Serial.println("Unknown command: " + command);
+            }
+        }
+
+        // **Turn off buzzer after 2 seconds**
+        if (buzzerActive && millis() - buzzerStartTime >= 2000) {
+            digitalWrite(PB13, LOW);
+            buzzerActive = false;
+        }
     }
 };
 
