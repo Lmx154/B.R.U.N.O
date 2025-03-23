@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <RadioLib.h>
+#include <HardwareTimer.h>
 
 // LoRa pins
 #define NSS   PA4
@@ -8,7 +9,16 @@
 #define DIO1  PA10
 SX1276 radio = new Module(NSS, DIO0, NRST, DIO1);
 
-// Global flag for operation completion
+// Servo pin and PWM settings
+#define SERVO_PIN PB10          // Servo connected to PB10 (Timer 2, Channel 3)
+const int pwmFreq = 200;        // 200 Hz PWM frequency for servo
+HardwareTimer *servoTimer = nullptr; // HardwareTimer object for PWM
+const int closedDuty = 71;      // 20% duty cycle (0.20 * 255)
+const int openDuty = 112;       // 50% duty cycle (0.50 * 255)
+bool isServoOpen = false;       // Tracks if servo is currently open
+unsigned long servoOpenStartTime = 0; // Tracks when servo opened
+
+// Global flag for LoRa operation completion
 volatile bool operationDone = false;
 
 // Communication interface
@@ -116,21 +126,80 @@ private:
     LoraComm lora;
     bool buzzerActive = false;
     unsigned long buzzerStartTime = 0;
+    float lastGyroZ = 0.0; // Store the previous gyro Z value to detect changes
+
+    // Parse NAVC data to extract gyro Z value (index 5 in the packet)
+    float getGyroZ(const String& data) {
+        int commaCount = 0;
+        String value = "";
+        for (int i = 0; i < data.length(); i++) {
+            if (data[i] == ',') {
+                commaCount++;
+                if (commaCount == 5) { // Gyro Z is the 6th value (index 5)
+                    i++; // Skip the comma
+                    while (i < data.length() && data[i] != ',') {
+                        value += data[i];
+                        i++;
+                    }
+                    return value.toFloat();
+                }
+            }
+        }
+        return 0.0; // Default if parsing fails
+    }
+
+    // Control servo based on gyro Z change
+    void controlServo(float currentGyroZ) {
+        // Detect a 180-degree flip by checking if gyro Z changes sign and exceeds a threshold
+        // Example: upright might be > 90 deg/s, upside down < -90 deg/s
+        bool flipped = (lastGyroZ > 90 && currentGyroZ < -90) || (lastGyroZ < -90 && currentGyroZ > 90);
+
+        if (flipped && !isServoOpen) {
+            // Flip detected, open the servo
+            servoTimer->setPWM(3, SERVO_PIN, pwmFreq, openDuty * 100 / 255); // Open servo
+            isServoOpen = true;
+            servoOpenStartTime = millis();
+            Serial.println("Servo opened (180-degree flip detected)");
+        }
+
+        // After 2 seconds in open state, return to closed
+        if (isServoOpen && millis() - servoOpenStartTime >= 2000) {
+            servoTimer->setPWM(3, SERVO_PIN, pwmFreq, closedDuty * 100 / 255); // Close servo
+            isServoOpen = false;
+            Serial.println("Servo closed (2 seconds elapsed)");
+        }
+
+        // Update lastGyroZ for the next iteration
+        lastGyroZ = currentGyroZ;
+    }
 
 public:
     void setup() {
+        // Initialize LoRa
         lora.setup();
+
+        // Initialize buzzer pin
         pinMode(PB13, OUTPUT);
         digitalWrite(PB13, LOW);
+
+        // Initialize servo PWM on PB10 (Timer 2, Channel 3)
+        pinMode(SERVO_PIN, OUTPUT);
+        servoTimer = new HardwareTimer(TIM2);
+        servoTimer->setPWM(3, SERVO_PIN, pwmFreq, closedDuty * 100 / 255); // Start and rest at closed
+        Serial.println("Servo initialized on PB10, resting at closed duty");
     }
 
     void loop() {
+        // Request and process NAVC data
         uart.requestData();
         String navcData = uart.receiveData();
         if (navcData != "") {
             lora.send(navcData);
+            float gyroZ = getGyroZ(navcData); // Extract gyro Z
+            controlServo(gyroZ);              // Control servo based on gyro change
         }
 
+        // Process LoRa commands from Ground Station
         String command = lora.receive();
         if (command != "") {
             if (command == "BUZZER_ON") {
@@ -147,6 +216,7 @@ public:
             }
         }
 
+        // Turn off buzzer after 2 seconds
         if (buzzerActive && millis() - buzzerStartTime >= 2000) {
             digitalWrite(PB13, LOW);
             buzzerActive = false;
