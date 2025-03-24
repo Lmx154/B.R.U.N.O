@@ -16,7 +16,10 @@ HardwareTimer *servoTimer = nullptr; // HardwareTimer object for PWM
 const int closedDuty = 71;      // 20% duty cycle (0.20 * 255)
 const int openDuty = 112;       // 50% duty cycle (0.50 * 255)
 bool isServoOpen = false;       // Tracks if servo is currently open
-unsigned long servoOpenStartTime = 0; // Tracks when servo opened
+
+// Altitude settings (in meters)
+const float TARGET_ALTITUDE = 1828.8; // Target altitude in meters (above sea level)
+float launchAltitude = 0.0;          // Launch site altitude in meters (set during setup)
 
 // Global flag for LoRa operation completion
 volatile bool operationDone = false;
@@ -126,51 +129,48 @@ private:
     LoraComm lora;
     bool buzzerActive = false;
     unsigned long buzzerStartTime = 0;
-    float lastGyroZ = 0.0; // Store the previous gyro Z value to detect changes
+    bool launchAltitudeSet = false; // Flag to set initial altitude once
 
-    // Parse NAVC data to extract gyro Z value (index 5 in the packet)
-    float getGyroZ(const String& data) {
+    // Parse NAVC data to extract altitude (index 8 in the packet)
+    float getAltitude(const String& data) {
         int commaCount = 0;
         String value = "";
         for (int i = 0; i < data.length(); i++) {
             if (data[i] == ',') {
                 commaCount++;
-                if (commaCount == 5) { // Gyro Z is the 6th value (index 5)
+                if (commaCount == 8) { // Altitude is the 9th value (index 8)
                     i++; // Skip the comma
                     while (i < data.length() && data[i] != ',') {
                         value += data[i];
                         i++;
                     }
-                    return value.toFloat();
+                    return value.toFloat(); // Altitude already in meters from BMP280
                 }
             }
         }
         return 0.0; // Default if parsing fails
     }
 
-    // Control servo based on gyro Z change
-    void controlServo(float currentGyroZ) {
-        // Detect a 180-degree flip by checking if gyro Z changes sign and exceeds a threshold
-        // Example: upright might be > 90 deg/s, upside down < -90 deg/s
-        bool flipped = (lastGyroZ > 90 && currentGyroZ < -90) || (lastGyroZ < -90 && currentGyroZ > 90);
+    // Control servo based on altitude
+    void controlServo(float currentAltitude) {
+        // Set launch altitude on first valid reading
+        if (!launchAltitudeSet && currentAltitude > 0) {
+            launchAltitude = currentAltitude;
+            launchAltitudeSet = true;
+            Serial.println("Launch altitude set to: " + String(launchAltitude) + " m");
+        }
 
-        if (flipped && !isServoOpen) {
-            // Flip detected, open the servo
+        // Ensure servo stays closed until target altitude is reached
+        if (!isServoOpen && currentAltitude < TARGET_ALTITUDE && launchAltitudeSet) {
+            servoTimer->setPWM(3, SERVO_PIN, pwmFreq, closedDuty * 100 / 255); // Keep servo closed
+        }
+
+        // Open servo at target altitude and leave it open
+        if (!isServoOpen && currentAltitude >= TARGET_ALTITUDE && launchAltitudeSet) {
             servoTimer->setPWM(3, SERVO_PIN, pwmFreq, openDuty * 100 / 255); // Open servo
             isServoOpen = true;
-            servoOpenStartTime = millis();
-            Serial.println("Servo opened (180-degree flip detected)");
+            Serial.println("Servo opened at altitude: " + String(currentAltitude) + " m");
         }
-
-        // After 2 seconds in open state, return to closed
-        if (isServoOpen && millis() - servoOpenStartTime >= 2000) {
-            servoTimer->setPWM(3, SERVO_PIN, pwmFreq, closedDuty * 100 / 255); // Close servo
-            isServoOpen = false;
-            Serial.println("Servo closed (2 seconds elapsed)");
-        }
-
-        // Update lastGyroZ for the next iteration
-        lastGyroZ = currentGyroZ;
     }
 
 public:
@@ -195,8 +195,8 @@ public:
         String navcData = uart.receiveData();
         if (navcData != "") {
             lora.send(navcData);
-            float gyroZ = getGyroZ(navcData); // Extract gyro Z
-            controlServo(gyroZ);              // Control servo based on gyro change
+            float altitude = getAltitude(navcData); // Extract altitude
+            controlServo(altitude);                 // Control servo based on altitude
         }
 
         // Process LoRa commands from Ground Station
