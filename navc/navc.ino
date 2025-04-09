@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
+
 #include <Wire.h>
 #include <Adafruit_BMP280.h>
 #include "BMI088.h"
@@ -105,35 +106,56 @@ private:
     return packet;
   }
 
-  void sendPacket(const String& packet) {
+  // Replace the sendPacket method in NAVC class
+  void sendPacket(const String& data) {
     digitalWrite(LED_PIN, HIGH);
+    
+    // Create framed packet with start/end markers
+    String packet = "<" + data + ">";
+    
+    // Debug output
     Serial.println("NAVC sending: " + packet);
-    SerialNavc.println(packet);
-    delay(10); // Ensure transmission
+    
+    // Send with careful timing
+    SerialNavc.print(packet);
+    SerialNavc.flush(); // Wait for transmission to complete
+    
     digitalWrite(LED_PIN, LOW);
   }
 
 public:
+  // Update the processRequest method to add error handling
   void processRequest() {
     unsigned long currentTime = millis();
-
-    // Check for incoming request first
-    if (SerialNavc.available() > 0) {
-      String request = SerialNavc.readStringUntil('\n');
-      request.trim();
-      Serial.println("NAVC received: " + request);
-      if (request == "REQUEST_DATA") {
-        String packet = collectData();
-        sendPacket(packet);
-        lastSendTime = currentTime; // Reset timer to avoid immediate autonomous send
-      }
-      while (SerialNavc.available() > 0) SerialNavc.read(); // Clear buffer
+    static unsigned long lastSuccessTime = 0;
+    
+    // Clear input buffer if it gets too full without proper requests
+    if (SerialNavc.available() > 32) {
+        Serial.println("NAVC buffer overflow, clearing");
+        while (SerialNavc.available()) SerialNavc.read();
     }
-    // Autonomous send only if no request was processed and 500ms has passed
-    else if (currentTime - lastSendTime >= 500) {
-      String packet = collectData();
-      sendPacket(packet);
-      lastSendTime = currentTime;
+
+    // Check for incoming request
+    if (SerialNavc.available() > 0) {
+        String request = SerialNavc.readStringUntil('\n');
+        request.trim();
+        
+        if (request == "REQUEST_DATA") {
+            String data = collectData();
+            sendPacket(data);
+            lastSendTime = currentTime;
+            lastSuccessTime = currentTime;
+        }
+        
+        // Clear any remaining characters
+        while (SerialNavc.available() > 0) SerialNavc.read();
+    }
+    // Autonomous send as backup if no requests received for extended period
+    else if (currentTime - lastSuccessTime >= 1000) { // 1 second timeout
+        String data = collectData();
+        sendPacket(data);
+        lastSendTime = currentTime;
+        lastSuccessTime = currentTime;
     }
   }
 };

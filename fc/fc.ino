@@ -33,23 +33,62 @@ public:
     virtual ~Communication() {}
 };
 
-// UART communication with NAVC
+// Replace the UartComm class with this improved version
 class UartComm {
-public:
-    void requestData() {
-        Serial2.println("REQUEST_DATA");
-    }
-    String receiveData() {
-        if (Serial2.available() > 0) {
-            String data = Serial2.readStringUntil('\n');
-            data.trim();
-            Serial.println("FC received from NAVC: " + data);
-            while (Serial2.available() > 0) Serial2.read();
-            return data;
+    private:
+        const unsigned long TIMEOUT = 100; // 100ms timeout
+        const unsigned long REQUEST_INTERVAL = 50; // 50ms between requests
+        unsigned long lastRequestTime = 0;
+        char buffer[512]; // Larger buffer for incoming data
+        int bufferIndex = 0;
+        bool frameStarted = false;
+    
+    public:
+        void requestData() {
+            unsigned long currentTime = millis();
+            // Only send request if enough time has passed since last request
+            if (currentTime - lastRequestTime >= REQUEST_INTERVAL) {
+                Serial2.println("REQUEST_DATA");
+                lastRequestTime = currentTime;
+            }
         }
-        return "";
-    }
-};
+    
+        String receiveData() {
+            unsigned long startTime = millis();
+            String packet = "";
+            
+            // Process all available bytes with timeout
+            while (Serial2.available() > 0 && (millis() - startTime < TIMEOUT)) {
+                char c = Serial2.read();
+                
+                // Start of frame marker
+                if (c == '<') {
+                    frameStarted = true;
+                    bufferIndex = 0;
+                    buffer[bufferIndex++] = c;
+                }
+                // End of frame marker
+                else if (c == '>' && frameStarted) {
+                    buffer[bufferIndex++] = c;
+                    buffer[bufferIndex] = '\0'; // Null terminate
+                    frameStarted = false;
+                    packet = String(buffer);
+                    break; // Complete packet received
+                }
+                // Store character if we're inside a frame
+                else if (frameStarted && bufferIndex < 511) {
+                    buffer[bufferIndex++] = c;
+                }
+            }
+    
+            // Debug output
+            if (packet.length() > 0) {
+                Serial.println("FC received from NAVC: " + packet);
+            }
+            
+            return packet;
+        }
+    };
 
 // LoRa communication with Ground Station
 class LoraComm : public Communication {
@@ -189,14 +228,17 @@ public:
         Serial.println("Servo initialized on PB10, resting at closed duty");
     }
 
+    // Update the FC loop to handle the framed packets
     void loop() {
         // Request and process NAVC data
         uart.requestData();
         String navcData = uart.receiveData();
-        if (navcData != "") {
+        if (navcData.startsWith("<") && navcData.endsWith(">")) {
+            // Remove frame markers for processing
+            navcData = navcData.substring(1, navcData.length()-1);
             lora.send(navcData);
-            float altitude = getAltitude(navcData); // Extract altitude
-            controlServo(altitude);                 // Control servo based on altitude
+            float altitude = getAltitude(navcData);
+            controlServo(altitude);
         }
 
         // Process LoRa commands from Ground Station
