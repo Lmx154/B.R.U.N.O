@@ -2,281 +2,189 @@
 #include <RadioLib.h>
 #include <HardwareTimer.h>
 
-// LoRa pins
-#define NSS   PA4
-#define DIO0  PA8
-#define NRST  PA9
-#define DIO1  PA10
+// ─── LoRa Configuration ────────────────────────────────────────────
+#define NSS    PA4
+#define DIO0   PA8
+#define NRST   PA9
+#define DIO1   PA10
 SX1276 radio = new Module(NSS, DIO0, NRST, DIO1);
 
-// Servo pin and PWM settings
-#define SERVO_PIN PB10          // Servo connected to PB10 (Timer 2, Channel 3)
-const int pwmFreq = 200;        // 200 Hz PWM frequency for servo
-HardwareTimer *servoTimer = nullptr; // HardwareTimer object for PWM
-const int closedDuty = 71;      // 20% duty cycle (0.20 * 255)
-const int openDuty = 112;       // 50% duty cycle (0.50 * 255)
-bool isServoOpen = false;       // Tracks if servo is currently open
+// ─── Servo Configuration ──────────────────────────────────────────
+#define SERVO_PIN PB10
+const int pwmFreq    = 200;   // Hz
+const int closedDuty = 71;    // ~20%
+const int openDuty   = 112;   // ~44%
+HardwareTimer *servoTimer = nullptr;
+bool isServoOpen       = false;
 
-// Altitude settings (in meters)
-const float TARGET_ALTITUDE = 1828.8; // Target altitude in meters (above sea level)
-float launchAltitude = 0.0;          // Launch site altitude in meters (set during setup)
+// ─── Altitude Settings ────────────────────────────────────────────
+const float TARGET_ALTITUDE = 1828.8;  // meters
+float launchAltitude        = 0.0;
 
-// Global flag for LoRa operation completion
-volatile bool operationDone = false;
+// ─── Parser Ring Buffer ──────────────────────────────────────────
+#define MAX_FRAMES     16
+#define MAX_FRAME_LEN 128
 
-// Communication interface
-class Communication {
-public:
-    virtual void send(const String& data) = 0;
-    virtual String receive() = 0;
-    virtual void setup() = 0;
-    virtual ~Communication() {}
-};
+static char frames[MAX_FRAMES][MAX_FRAME_LEN];
+static volatile int frameHead = 0, frameTail = 0;
 
-// Replace the UartComm class with this improved version
-class UartComm {
-    private:
-        const unsigned long TIMEOUT = 100; // 100ms timeout
-        const unsigned long REQUEST_INTERVAL = 50; // 50ms between requests
-        unsigned long lastRequestTime = 0;
-        char buffer[512]; // Larger buffer for incoming data
-        int bufferIndex = 0;
-        bool frameStarted = false;
-    
-    public:
-        void requestData() {
-            unsigned long currentTime = millis();
-            // Only send request if enough time has passed since last request
-            if (currentTime - lastRequestTime >= REQUEST_INTERVAL) {
-                Serial2.println("REQUEST_DATA");
-                lastRequestTime = currentTime;
-            }
-        }
-    
-        String receiveData() {
-            unsigned long startTime = millis();
-            String packet = "";
-            
-            // Process all available bytes with timeout
-            while (Serial2.available() > 0 && (millis() - startTime < TIMEOUT)) {
-                char c = Serial2.read();
-                
-                // Start of frame marker
-                if (c == '<') {
-                    frameStarted = true;
-                    bufferIndex = 0;
-                    buffer[bufferIndex++] = c;
-                }
-                // End of frame marker
-                else if (c == '>' && frameStarted) {
-                    buffer[bufferIndex++] = c;
-                    buffer[bufferIndex] = '\0'; // Null terminate
-                    frameStarted = false;
-                    packet = String(buffer);
-                    break; // Complete packet received
-                }
-                // Store character if we're inside a frame
-                else if (frameStarted && bufferIndex < 511) {
-                    buffer[bufferIndex++] = c;
-                }
-            }
-    
-            // Debug output
-            if (packet.length() > 0) {
-                Serial.println("FC received from NAVC: " + packet);
-            }
-            
-            return packet;
-        }
-    };
+// Frame builder
+static char currFrame[MAX_FRAME_LEN];
+static int  currIndex = 0;
 
-// LoRa communication with Ground Station
-class LoraComm : public Communication {
-private:
-    String receivedData;
-    uint8_t fcAddress = 0xA2;            // FC address
-    uint8_t groundStationAddress = 0xA1; // Ground Station address
-
-    String getTimestamp() {
-        unsigned long currentTime = millis();
-        int seconds = (currentTime / 1000) % 60;
-        int minutes = (currentTime / 60000) % 60;
-        int hours = (currentTime / 3600000) % 24;
-        return String("[2025/03/22 ") + (hours < 10 ? "0" : "") + hours + ":" +
-               (minutes < 10 ? "0" : "") + minutes + ":" + 
-               (seconds < 10 ? "0" : "") + seconds + "]";
+// Called automatically by Arduino when Serial2 has data
+void serialEvent2() {
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    if (c == '<') {
+      currIndex = 0;
+      currFrame[currIndex++] = c;
     }
+    else if (currIndex > 0) {
+      if (currIndex < MAX_FRAME_LEN - 1) {
+        currFrame[currIndex++] = c;
+      }
+      if (c == '>') {
+        currFrame[currIndex] = '\0';
+        // enqueue
+        strncpy(frames[frameHead], currFrame, MAX_FRAME_LEN);
+        frameHead = (frameHead + 1) % MAX_FRAMES;
+        currIndex = 0;
+      }
+    }
+  }
+}
+
+// ─── LoRa Communication ────────────────────────────────────────────
+class LoraComm {
+  String receivedData;
+  const uint8_t fcAddr = 0xA2, gsAddr = 0xA1;
 
 public:
-    void setup() override {
-        Serial.println("Initializing LoRa...");
-        int state = radio.begin(915.0);
-        if (state != RADIOLIB_ERR_NONE) {
-            Serial.println("LoRa init failed: " + String(state));
-            while (true);
-        }
-        radio.setSpreadingFactor(7);
-        radio.setBandwidth(250.0);
-        radio.setCodingRate(5);
-        radio.setSyncWord(0xAB);
-        radio.setNodeAddress(fcAddress);
-        radio.setDio0Action([]() { operationDone = true; }, RISING);
-        radio.startReceive();
-        Serial.println("LoRa initialized, address: " + String(fcAddress));
-    }
+  void setup() {
+    radio.begin(915.0);
+    radio.setSpreadingFactor(7);
+    radio.setBandwidth(250.0);
+    radio.setCodingRate(5);
+    radio.setSyncWord(0xAB);
+    radio.setNodeAddress(fcAddr);
+    radio.setDio0Action([](){}, RISING);
+    radio.startReceive();
+  }
 
-    void send(const String& data) override {
-        String dataCopy = data;
-        String packet = getTimestamp() + " " + dataCopy;
-        Serial.println(packet);
-        operationDone = false;
-        int state = radio.startTransmit(dataCopy, groundStationAddress);
-        if (state == RADIOLIB_ERR_NONE) {
-            unsigned long startTime = millis();
-            while (!operationDone && millis() - startTime < 1000) {
-                delay(1);
-            }
-            radio.finishTransmit();
-        } else {
-            Serial.println("Transmit failed: " + String(state));
-        }
-        radio.startReceive();
+  void send(String data) {
+    // transmit() is blocking and returns an error code
+    int16_t state = radio.transmit(data, gsAddr);
+    if (state != RADIOLIB_ERR_NONE) {
+      Serial.println("LoRa TX err: " + String(state));
     }
+    // restart receive
+    radio.startReceive();
+  }
 
-    String receive() override {
-        if (operationDone) {
-            operationDone = false;
-            int state = radio.readData(receivedData);
-            if (state == RADIOLIB_ERR_NONE) {
-                String packet = getTimestamp() + " " + receivedData;
-                Serial.println("FC received from GS: " + packet);
-                radio.startReceive();
-                return receivedData;
-            } else {
-                Serial.println("Receive failed: " + String(state));
-            }
-            radio.startReceive();
-        }
-        return "";
+  String receive() {
+    // non-blocking check
+    if (!radio.available()) {
+      return "";
     }
+    int16_t state = radio.receive(receivedData);
+    radio.startReceive();
+    if (state == RADIOLIB_ERR_NONE) {
+      return receivedData;
+    }
+    return "";
+  }
 };
 
-// FC class
+// ─── Flight Computer ──────────────────────────────────────────────
 class FC {
-private:
-    UartComm uart;
-    LoraComm lora;
-    bool buzzerActive = false;
-    unsigned long buzzerStartTime = 0;
-    bool launchAltitudeSet = false; // Flag to set initial altitude once
+  LoraComm lora;
+  bool     buzzerActive = false;
+  unsigned long buzzerStart = 0;
 
-    // Parse NAVC data to extract altitude (index 8 in the packet)
-    float getAltitude(const String& data) {
-        int commaCount = 0;
-        String value = "";
-        for (int i = 0; i < data.length(); i++) {
-            if (data[i] == ',') {
-                commaCount++;
-                if (commaCount == 8) { // Altitude is the 9th value (index 8)
-                    i++; // Skip the comma
-                    while (i < data.length() && data[i] != ',') {
-                        value += data[i];
-                        i++;
-                    }
-                    return value.toFloat(); // Altitude already in meters from BMP280
-                }
-            }
-        }
-        return 0.0; // Default if parsing fails
+  // extract 9th CSV field (BMP280 altitude)
+  float getAltitude(const String &d) {
+    int commas = 0;
+    for (int i = 0; i < d.length(); i++) {
+      if (d[i] == ',' && ++commas == 8) {
+        int j = d.indexOf(',', i + 1);
+        return d.substring(i + 1, j < 0 ? d.length() : j).toFloat();
+      }
     }
+    return 0.0f;
+  }
 
-    // Control servo based on altitude
-    void controlServo(float currentAltitude) {
-        // Set launch altitude on first valid reading
-        if (!launchAltitudeSet && currentAltitude > 0) {
-            launchAltitude = currentAltitude;
-            launchAltitudeSet = true;
-            Serial.println("Launch altitude set to: " + String(launchAltitude) + " m");
-        }
-
-        // Ensure servo stays closed until target altitude is reached
-        if (!isServoOpen && currentAltitude < TARGET_ALTITUDE && launchAltitudeSet) {
-            servoTimer->setPWM(3, SERVO_PIN, pwmFreq, closedDuty * 100 / 255); // Keep servo closed
-        }
-
-        // Open servo at target altitude and leave it open
-        if (!isServoOpen && currentAltitude >= TARGET_ALTITUDE && launchAltitudeSet) {
-            servoTimer->setPWM(3, SERVO_PIN, pwmFreq, openDuty * 100 / 255); // Open servo
-            isServoOpen = true;
-            Serial.println("Servo opened at altitude: " + String(currentAltitude) + " m");
-        }
+  void controlServo(float alt) {
+    if (launchAltitude == 0.0f && alt > 0.0f) {
+      launchAltitude = alt;
+      Serial.println("Launch alt: " + String(launchAltitude));
     }
+    if (!isServoOpen && alt < TARGET_ALTITUDE) {
+      servoTimer->setPWM(3, SERVO_PIN, pwmFreq, closedDuty * 100 / 255);
+    }
+    else if (!isServoOpen && alt >= TARGET_ALTITUDE) {
+      servoTimer->setPWM(3, SERVO_PIN, pwmFreq, openDuty * 100 / 255);
+      isServoOpen = true;
+      Serial.println("Servo opened at alt: " + String(alt));
+    }
+  }
 
 public:
-    void setup() {
-        // Initialize LoRa
-        lora.setup();
+  void setup() {
+    // LoRa & buzzer & servo
+    lora.setup();
+    pinMode(PB13, OUTPUT); digitalWrite(PB13, LOW);
+    pinMode(SERVO_PIN, OUTPUT);
+    servoTimer = new HardwareTimer(TIM2);
+    servoTimer->setPWM(3, SERVO_PIN, pwmFreq, closedDuty * 100 / 255);
 
-        // Initialize buzzer pin
-        pinMode(PB13, OUTPUT);
-        digitalWrite(PB13, LOW);
+    // Serial2 for NAVC
+    Serial2.begin(115200);
+  }
 
-        // Initialize servo PWM on PB10 (Timer 2, Channel 3)
-        pinMode(SERVO_PIN, OUTPUT);
-        servoTimer = new HardwareTimer(TIM2);
-        servoTimer->setPWM(3, SERVO_PIN, pwmFreq, closedDuty * 100 / 255); // Start and rest at closed
-        Serial.println("Servo initialized on PB10, resting at closed duty");
+  void loop() {
+    // one packet per pass
+    if (frameTail != frameHead) {
+      char *pkt = frames[frameTail++];
+      if (frameTail >= MAX_FRAMES) frameTail = 0;
+
+      // print raw NAVC packet
+      Serial.write(pkt, strlen(pkt));
+      Serial.write("\r\n");
+
+      // strip framing and forward
+      String payload = String(pkt).substring(1, strlen(pkt) - 1);
+      lora.send(payload);
+      controlServo(getAltitude(payload));
     }
 
-    // Update the FC loop to handle the framed packets
-    void loop() {
-        // Request and process NAVC data
-        uart.requestData();
-        String navcData = uart.receiveData();
-        if (navcData.startsWith("<") && navcData.endsWith(">")) {
-            // Remove frame markers for processing
-            navcData = navcData.substring(1, navcData.length()-1);
-            lora.send(navcData);
-            float altitude = getAltitude(navcData);
-            controlServo(altitude);
-        }
-
-        // Process LoRa commands from Ground Station
-        String command = lora.receive();
-        if (command != "") {
-            if (command == "BUZZER_ON") {
-                digitalWrite(PB13, HIGH);
-                Serial.println("Buzzer activated");
-                if (digitalRead(PB13) == HIGH) {
-                    buzzerStartTime = millis();
-                    buzzerActive = true;
-                    lora.send("BUZZER_ON_ACK");
-                } else {
-                    lora.send("BUZZER_ON_ERR");
-                    Serial.println("Buzzer failed to activate");
-                }
-            }
-        }
-
-        // Turn off buzzer after 2 seconds
-        if (buzzerActive && millis() - buzzerStartTime >= 2000) {
-            digitalWrite(PB13, LOW);
-            buzzerActive = false;
-            Serial.println("Buzzer deactivated");
-        }
+    // Ground‑Station commands
+    String cmd = lora.receive();
+    if (cmd == "BUZZER_ON") {
+      digitalWrite(PB13, HIGH);
+      buzzerActive = true;
+      buzzerStart  = millis();
+      lora.send("BUZZER_ON_ACK");
     }
+    if (buzzerActive && millis() - buzzerStart >= 2000) {
+      digitalWrite(PB13, LOW);
+      buzzerActive = false;
+      Serial.println("Buzzer off");
+    }
+  }
 };
 
-// Global instance
 FC fc;
 
 void setup() {
-    Serial.begin(115200);
-    Serial2.begin(115200);
-    fc.setup();
+  // USB‑CDC
+  Serial.begin(921600);
+  // start the FC
+  fc.setup();
 }
 
 void loop() {
-    fc.loop();
-    delay(10); // Reduced delay for faster response
+  fc.loop();
+  // let serialEvent2 run
+  delay(1);
 }
