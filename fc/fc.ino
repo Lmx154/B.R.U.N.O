@@ -73,17 +73,14 @@ public:
   }
 
   void send(String data) {
-    // transmit() is blocking and returns an error code
     int16_t state = radio.transmit(data, gsAddr);
     if (state != RADIOLIB_ERR_NONE) {
       Serial.println("LoRa TX err: " + String(state));
     }
-    // restart receive
     radio.startReceive();
   }
 
   String receive() {
-    // non-blocking check
     if (!radio.available()) {
       return "";
     }
@@ -148,13 +145,13 @@ public:
       char *pkt = frames[frameTail++];
       if (frameTail >= MAX_FRAMES) frameTail = 0;
 
-      // print raw NAVC packet
-      Serial.write(pkt, strlen(pkt));
-      Serial.write("\r\n");
-
       // strip framing and forward
       String payload = String(pkt).substring(1, strlen(pkt) - 1);
       lora.send(payload);
+
+      // now print only what went over LoRa
+      Serial.println(payload);
+
       controlServo(getAltitude(payload));
     }
 
