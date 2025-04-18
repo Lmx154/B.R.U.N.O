@@ -1,214 +1,231 @@
+// navc.ino
+
 #include <Arduino.h>
 #include <HardwareSerial.h>
-
 #include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
 #include <Adafruit_BMP280.h>
 #include "BMI088.h"
+#include "bmm150.h"
+#include "bmm150_defs.h"
+#include <RTClib.h>                // ← 1) include RTClib
 
-// Define Serial1 as UART1 on PB6 (TX) and PB7 (RX) for GPS
-HardwareSerial Serial1(PB7, PB6);  // RX, TX
+// Define Serial1 for GPS on PB7 (RX) and PB6 (TX)
+HardwareSerial Serial1(PB7, PB6);  // GPS: RX, TX
 
-// Define UART for NAVC-to-FC communication
+// Use Serial2 for communication with the FC
 #define SerialNavc Serial2
-const int LED_PIN = PC13; // Onboard LED for data transmission indicator
 
-// Global variables for parsed GPS data
-String lastLat = "0";
-String lastLon = "0";
-int satellites = 0;
-String lastAltitude = "0"; // GPS altitude
+const int LED_PIN   = PC13;   // On‑board LED
+const int SD_CS_PIN = PA4;    // SD CS
+
+// Sensor objects
+Adafruit_BMP280 bmp;           // BMP280 @0x77
+Bmi088Accel    accel(Wire, 0x19);
+Bmi088Gyro     gyro(Wire, 0x69);
+BMM150         mag;            // BMM150 @0x13
+
+RTC_PCF8563    rtc;            // ← 1) RTC object
+
+String lastLat      = "0";
+String lastLon      = "0";
+int    satellites   = 0;
+String lastAltitude = "0";
 String nmeaSentence = "";
-bool hasFix = false;
+bool   hasFix       = false;
 
-// Global sensor objects
-Adafruit_BMP280 bmp;
-Bmi088Accel accel(Wire, 0x18);
-Bmi088Gyro gyro(Wire, 0x68);
+#define SEALEVELPRESSURE_HPA 1013.25F
 
-#define SEALEVELPRESSURE_HPA (1013.25)
+// ─── NMEA parsing ────────────────────────────────────
 
-// Helper function to split NMEA sentence into fields
-void splitSentence(String sentence, String fields[], int maxFields) {
-  int fieldIndex = 0;
-  String currentField = "";
-  for (int i = 0; i < sentence.length() && fieldIndex < maxFields; i++) {
+void splitSentence(const String &sentence, String fields[], int maxFields) {
+  int idx = 0; String cur;
+  for (int i = 0; i < sentence.length() && idx < maxFields; i++) {
     if (sentence[i] == ',') {
-      fields[fieldIndex] = currentField;
-      currentField = "";
-      fieldIndex++;
-    } else {
-      currentField += sentence[i];
-    }
+      fields[idx++] = cur;
+      cur = "";
+    } else cur += sentence[i];
   }
-  if (fieldIndex < maxFields) {
-    fields[fieldIndex] = currentField;
-  }
+  if (idx < maxFields) fields[idx] = cur;
 }
 
-// Parse $GNRMC sentence for latitude and longitude
-void parseGNRMC(String sentence) {
-  String fields[15];
-  splitSentence(sentence, fields, 15);
-  if (fields[2] == "A") {
-    lastLat = fields[3] + fields[4];
-    lastLon = fields[5] + fields[6];
-    hasFix = true;
+void parseGNRMC(const String &s) {
+  String f[15]; splitSentence(s, f, 15);
+  if (f[2] == "A") {
+    lastLat = f[3] + f[4];
+    lastLon = f[5] + f[6];
+    hasFix  = true;
   } else {
     hasFix = false;
-    lastLat = "0";
-    lastLon = "0";
+    lastLat = lastLon = "0";
   }
 }
 
-// Parse $GNGGA sentence for satellites and altitude
-void parseGNGGA(String sentence) {
-  String fields[15];
-  splitSentence(sentence, fields, 15);
-  if (fields[7] != "" && fields[7].toInt() > 0) {
-    satellites = fields[7].toInt();
-    if (fields[9] != "") lastAltitude = fields[9];
-    hasFix = true;
+void parseGNGGA(const String &s) {
+  String f[15]; splitSentence(s, f, 15);
+  if (f[7].toInt() > 0) {
+    satellites   = f[7].toInt();
+    lastAltitude = f[9].length() ? f[9] : "0";
+    hasFix       = true;
   } else {
-    satellites = 0;
+    satellites   = 0;
     lastAltitude = "0";
-    if (!hasFix) {
-      lastLat = "0";
-      lastLon = "0";
-    }
+    if (!hasFix) lastLat = lastLon = "0";
   }
 }
 
-// NAVC class
+// ─── NAVC class ─────────────────────────────────────
+
 class NAVC {
-private:
-  uint32_t id = 1;
-  unsigned long lastSendTime = 0; // For autonomous sending
+  unsigned long lastSuccessTime = 0;
 
   String collectData() {
+    // ← 2) read RTC timestamp first
+    DateTime now = rtc.now();
+    char ts[20];
+    snprintf(ts, sizeof(ts),
+             "%04d-%02d-%02d %02d:%02d:%02d",
+             now.year(), now.month(), now.day(),
+             now.hour(), now.minute(), now.second());
+    String timestamp = String(ts);
+
+    // sensor reads
     accel.readSensor();
     gyro.readSensor();
-    float temp = bmp.readTemperature();
+    mag.read_mag_data();
+    float magX = mag.raw_mag_data.raw_datax;
+    float magY = mag.raw_mag_data.raw_datay;
+    float magZ = mag.raw_mag_data.raw_dataz;
+    float temp     = bmp.readTemperature();
     float pressure = bmp.readPressure() / 100.0F;
     float altitude = bmp.readAltitude(SEALEVELPRESSURE_HPA);
 
-    String packet = String(accel.getAccelX_mss(), 2) + "," + 
-                    String(accel.getAccelY_mss(), 2) + "," + 
-                    String(accel.getAccelZ_mss(), 2) + "," + 
-                    String(round(gyro.getGyroX_rads() * (180.0 / PI))) + "," + 
-                    String(round(gyro.getGyroY_rads() * (180.0 / PI))) + "," + 
-                    String(round(gyro.getGyroZ_rads() * (180.0 / PI))) + "," +
-                    String(temp, 2) + "," + String(pressure, 2) + "," + String(altitude, 2) + "," +
-                    "0.0,0.0,0.0," + lastLat + "," + lastLon + "," + String(satellites) + "," + lastAltitude;
+    // build CSV, *prefixing* with timestamp
+    String packet = timestamp + "," +
+                    String(accel.getAccelX_mss(), 2) + "," +
+                    String(accel.getAccelY_mss(), 2) + "," +
+                    String(accel.getAccelZ_mss(), 2) + "," +
+                    String(round(gyro.getGyroX_rads() * 180.0/PI)) + "," +
+                    String(round(gyro.getGyroY_rads() * 180.0/PI)) + "," +
+                    String(round(gyro.getGyroZ_rads() * 180.0/PI)) + "," +
+                    String(temp, 2) + "," +
+                    String(pressure, 2) + "," +
+                    String(altitude, 2) + "," +
+                    String(magX, 2) + "," +
+                    String(magY, 2) + "," +
+                    String(magZ, 2) + "," +
+                    lastLat + "," + lastLon + "," +
+                    String(satellites) + "," +
+                    lastAltitude;
 
-    if (packet.length() > 255) {
-      packet = packet.substring(0, 255);
-    }
+    if (packet.length() > 255) packet = packet.substring(0, 255);
     return packet;
   }
 
-  // Replace the sendPacket method in NAVC class
-  void sendPacket(const String& data) {
+  void sendPacket(const String &data) {
+    String framed = "<" + data + ">";
     digitalWrite(LED_PIN, HIGH);
-    
-    // Create framed packet with start/end markers
-    String packet = "<" + data + ">";
-    
-    // Debug output
-    Serial.println("NAVC sending: " + packet);
-    
-    // Send with careful timing
-    SerialNavc.print(packet);
-    SerialNavc.flush(); // Wait for transmission to complete
-    
+
+    // to FC
+    SerialNavc.print(framed);
+    SerialNavc.flush();
+
+    // to USB‑Serial
+    Serial.println(framed);
+
+    // to SD
+    File f = SD.open("data_log.txt", FILE_WRITE);
+    if (f) {
+      f.println(framed);
+      f.close();
+    }
+
     digitalWrite(LED_PIN, LOW);
   }
 
 public:
-  // Update the processRequest method to add error handling
   void processRequest() {
-    unsigned long currentTime = millis();
-    static unsigned long lastSuccessTime = 0;
-    
-    // Clear input buffer if it gets too full without proper requests
+    unsigned long now = millis();
+
     if (SerialNavc.available() > 32) {
-        Serial.println("NAVC buffer overflow, clearing");
-        while (SerialNavc.available()) SerialNavc.read();
+      while (SerialNavc.available()) SerialNavc.read();
     }
 
-    // Check for incoming request
-    if (SerialNavc.available() > 0) {
-        String request = SerialNavc.readStringUntil('\n');
-        request.trim();
-        
-        if (request == "REQUEST_DATA") {
-            String data = collectData();
-            sendPacket(data);
-            lastSendTime = currentTime;
-            lastSuccessTime = currentTime;
-        }
-        
-        // Clear any remaining characters
-        while (SerialNavc.available() > 0) SerialNavc.read();
+    if (SerialNavc.available()) {
+      String req = SerialNavc.readStringUntil('\n');
+      req.trim();
+      if (req == "REQUEST_DATA") {
+        sendPacket(collectData());
+        lastSuccessTime = now;
+      }
+      while (SerialNavc.available()) SerialNavc.read();
     }
-    // Autonomous send as backup if no requests received for extended period
-    else if (currentTime - lastSuccessTime >= 1000) { // 1 second timeout
-        String data = collectData();
-        sendPacket(data);
-        lastSendTime = currentTime;
-        lastSuccessTime = currentTime;
+    else if (now - lastSuccessTime >= 20) {
+      sendPacket(collectData());
+      lastSuccessTime = now;
     }
   }
-};
+} navc;
 
-// Global instance
-NAVC navc;
+// ─── setup & loop ────────────────────────────────────
 
 void setup() {
-  Serial.begin(115200);
-  Serial1.begin(9600); // GPS
-  SerialNavc.begin(115200); // NAVC-to-FC
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-  Serial.println("Starting NMEA parsing and NAVC on STM32F4 Black Pill...");
 
+  Serial.begin(115200);
+  Serial1.begin(9600);
+  SerialNavc.begin(115200);
+
+  // SD card
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD init failed!");
+    while (1) delay(10);
+  }
+
+  Serial.println("Starting Autonomous NAVC...");
+
+  // I2C on PB8/PB9
   Wire.setSCL(PB8);
   Wire.setSDA(PB9);
   Wire.begin();
-  Wire.setClock(100000); // 100kHz
+  Wire.setClock(100000);
 
-  if (!bmp.begin(0x76)) {
-    Serial.println("BMP280 init failed!");
-    while (1) delay(10);
-  }
+  // BMP280
+  if (!bmp.begin(0x77)) while (1) delay(10);
   bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
                   Adafruit_BMP280::SAMPLING_X2,
                   Adafruit_BMP280::SAMPLING_X16,
                   Adafruit_BMP280::FILTER_X16,
                   Adafruit_BMP280::STANDBY_MS_500);
 
-  int status = accel.begin();
-  if (status < 0) {
-    Serial.println("Accel init failed!");
-    while (1) delay(10);
-  }
+  // BMI088
+  if (accel.begin() < 0) while (1) delay(10);
+  if (gyro.begin()  < 0) while (1) delay(10);
 
-  status = gyro.begin();
-  if (status < 0) {
-    Serial.println("Gyro init failed!");
+  // BMM150
+  if (mag.initialize() != BMM150_OK) while (1) delay(10);
+
+  // ← 3) initialize RTC
+  if (!rtc.begin()) {
+    Serial.println("RTC init failed!");
     while (1) delay(10);
   }
+  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 }
 
 void loop() {
+  // GPS parsing
   while (Serial1.available()) {
     char c = Serial1.read();
-    if (c == '$') {
-      nmeaSentence = "$";
-    } else if (c == '\n' && nmeaSentence.length() > 0) {
+    if (c == '$')        nmeaSentence = "$";
+    else if (c == '\n' && nmeaSentence.length()) {
       if (nmeaSentence.startsWith("$GNRMC")) parseGNRMC(nmeaSentence);
       else if (nmeaSentence.startsWith("$GNGGA")) parseGNGGA(nmeaSentence);
       nmeaSentence = "";
-    } else if (nmeaSentence.length() > 0) {
+    }
+    else if (nmeaSentence.length()) {
       nmeaSentence += c;
     }
   }
