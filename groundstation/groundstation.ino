@@ -14,7 +14,7 @@ volatile bool operationDone = false;
 // Communication interface
 class Communication {
 public:
-    virtual void send(const String& data) = 0;
+    virtual void send(String data) = 0;     // accept by value
     virtual String receive() = 0;
     virtual void setup() = 0;
     virtual ~Communication() {}
@@ -24,18 +24,8 @@ public:
 class LoraComm : public Communication {
 private:
     String receivedData;
-    uint8_t groundStationAddress = 0xA1; // Ground Station address
-    uint8_t fcAddress = 0xA2;            // FC address
-
-    String getTimestamp() {
-        unsigned long currentTime = millis();
-        int seconds = (currentTime / 1000) % 60;
-        int minutes = (currentTime / 60000) % 60;
-        int hours = (currentTime / 3600000) % 24;
-        return String("[2025/03/22 ") + (hours < 10 ? "0" : "") + hours + ":" +
-               (minutes < 10 ? "0" : "") + minutes + ":" + 
-               (seconds < 10 ? "0" : "") + seconds + "]";
-    }
+    const uint8_t groundStationAddress = 0xA1; // Ground Station address
+    const uint8_t fcAddress              = 0xA2; // FC address
 
 public:
     void setup() override {
@@ -55,39 +45,28 @@ public:
         Serial.println("LoRa initialized, address: " + String(groundStationAddress));
     }
 
-    void send(const String& data) override {
-        String dataCopy = data;
-        String packet = getTimestamp() + " " + dataCopy;
-        Serial.println("GS sending: " + packet);
-        operationDone = false;
-        int state = radio.startTransmit(dataCopy, fcAddress);
-        if (state == RADIOLIB_ERR_NONE) {
-            unsigned long startTime = millis();
-            while (!operationDone && millis() - startTime < 1000) {
-                delay(1);
-            }
-            radio.finishTransmit();
-        } else {
+    // Take data by value so it can bind to RadioLib's String& API
+    void send(String data) override {
+        int state = radio.transmit(data, fcAddress);
+        if (state != RADIOLIB_ERR_NONE) {
             Serial.println("Transmit failed: " + String(state));
         }
         radio.startReceive();
     }
 
     String receive() override {
-        if (operationDone) {
-            operationDone = false;
-            int state = radio.readData(receivedData);
-            if (state == RADIOLIB_ERR_NONE) {
-                String packet = getTimestamp() + " " + receivedData;
-                Serial.println(packet);
-                radio.startReceive();
-                return receivedData;
-            } else {
-                Serial.println("Receive failed: " + String(state));
-            }
-            radio.startReceive();
+        if (!operationDone) {
+            return "";
         }
-        return "";
+        operationDone = false;
+        int state = radio.receive(receivedData);
+        radio.startReceive();
+        if (state == RADIOLIB_ERR_NONE) {
+            return receivedData;
+        } else {
+            Serial.println("Receive failed: " + String(state));
+            return "";
+        }
     }
 };
 
@@ -100,26 +79,26 @@ public:
     void setup() {
         lora.setup();
     }
+
     void loop() {
+        // Check for incoming telemetry from FC
         String message = lora.receive();
-        if (message != "") {
-            // Process silently unless it's an ACK/ERR
-            if (message == "BUZZER_ON_ACK" || message == "BUZZER_ON_ERR") {
-                Serial.println("GS received: " + message);
-            }
+        if (message.length() > 0) {
+            // ONLY print the raw payload
+            Serial.println(message);
         }
 
+        // Forward any serial input as commands
         if (Serial.available() > 0) {
             String input = Serial.readStringUntil('\n');
             input.trim();
-            if (input == "BUZZER_ON") {
-                lora.send("BUZZER_ON");
+            if (input.length() > 0) {
+                lora.send(input);
             }
         }
     }
 };
 
-// Global instance
 GroundStation groundStation;
 
 void setup() {
@@ -129,5 +108,5 @@ void setup() {
 
 void loop() {
     groundStation.loop();
-    delay(10); // Reduced delay for faster response
+    delay(10);
 }
