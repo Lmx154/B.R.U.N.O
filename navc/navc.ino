@@ -9,7 +9,7 @@
 #include "BMI088.h"
 #include "bmm150.h"
 #include "bmm150_defs.h"
-#include <RTClib.h>                // ← 1) include RTClib
+#include <RTClib.h>                // ← include RTClib for DS3231
 
 // Define Serial1 for GPS on PB7 (RX) and PB6 (TX)
 HardwareSerial Serial1(PB7, PB6);  // GPS: RX, TX
@@ -26,7 +26,7 @@ Bmi088Accel    accel(Wire, 0x19);
 Bmi088Gyro     gyro(Wire, 0x69);
 BMM150         mag;            // BMM150 @0x13
 
-RTC_PCF8563    rtc;            // ← 1) RTC object
+RTC_DS3231     rtc;            // ← use DS3231 instead of PCF8563
 
 String lastLat      = "0";
 String lastLon      = "0";
@@ -81,7 +81,7 @@ class NAVC {
   unsigned long lastSuccessTime = 0;
 
   String collectData() {
-    // ← 2) read RTC timestamp first
+    // ← read DS3231 timestamp first
     DateTime now = rtc.now();
     char ts[20];
     snprintf(ts, sizeof(ts),
@@ -207,11 +207,12 @@ void setup() {
   // BMM150
   if (mag.initialize() != BMM150_OK) while (1) delay(10);
 
-  // ← 3) initialize RTC
+  // ← initialize DS3231
   if (!rtc.begin()) {
     Serial.println("RTC init failed!");
     while (1) delay(10);
   }
+  // only set the RTC once — comment out after initial flash:
   rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 }
 
