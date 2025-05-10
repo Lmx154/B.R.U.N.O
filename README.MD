@@ -1,116 +1,168 @@
-# B.R.U.N.O Telemetry System
+# B.R.U.N.O Flight Computer & Ground Station
 
-This repository contains the three key components of the B.R.U.N.O telemetry system:
+## Overview
+
+The **B.R.U.N.O** project implements a two-board flight computer system and a matching ground station for telemetry in rocketry applications. It consists of three main components:
+
+* **NAVC** (`navc/navc.ino`): Autonomous sensor data collection, packaging, and local SD logging.
+* **FC** (`fc/fc.ino`): Flight computer that reads NAVC packets over UART, transmits telemetry via LoRa, and controls onboard actuators (servo & buzzer).
+* **Ground Station** (`groundstation/groundstation.ino`): Receives telemetry via LoRa, displays raw payloads over USB, and forwards user commands back to the FC.
+
+All telemetry packets are framed and sent to the **Sentinel** software for parsing and visualization.
+
+## Directory Structure
 
 ```
-b.r.u.n.o/
-├── README.MD
+lmx154-b.r.u.n.o/
 ├── fc/
-│   └── fc.ino
+│   └── fc.ino               # Flight computer firmware
 ├── groundstation/
-│   └── groundstation.ino
+│   └── groundstation.ino    # Ground station firmware
 └── navc/
-    └── navc.ino
+    └── navc.ino             # Autonomous NAVC data logger
 ```
 
-Each component runs on an STM32 “Black Pill” board (NAVC and FC) or any Arduino‑compatible board with an SX1276 LoRa module (Ground Station).
+## Prerequisites
 
----
+* Arduino IDE (or PlatformIO)
+* Libraries:
 
-## 1. Navigation Computer (NAVC) — `navc/navc.ino`
+  * RadioLib
+  * HardwareTimer
+  * Adafruit\_BMP280
+  * BMI088 (Accel & Gyro)
+  * BMM150
+  * RTClib
+  * TinyGPSPlus
+  * SD
+  * Wire, SPI
 
-### Role & Overview
-- **Reads real sensors** over I²C and UART:
-  - **BMP280** barometer/temperature (@ 0x77)
-  - **BMI088** accelerometer (@ 0x19) & gyroscope (@ 0x69)
-  - **BMM150** magnetometer (@ 0x13)
-  - **PCF8563** RTC for timestamping (@ 0x51)
-  - **GPS** NMEA sentences on `Serial1` (PB7 RX, PB6 TX)
+## Hardware Connections
 
-- **Data handling**:
-  - Parses GNRMC/GNGGA for latitude, longitude, satellites, altitude
-  - Reads sensors at up to 50 Hz
-  - Prefixes each record with an RTC timestamp (`YYYY‑MM‑DD HH:MM:SS`)
-  - Frames the CSV string in `<...>` for easy UART parsing
+### NAVC Board
 
-- **Outputs**:
-  - **Serial2** (`SerialNavc`) at 115200 baud for FC requests or autonomous sends every 20 ms
-  - **USB‑CDC** (`Serial`) mirroring each packet for debug / serial monitor
-  - **SD card** `"data_log.txt"` with one `<packet>` per line
+* **GPS**: UART1 on PB7 (RX) / PB6 (TX)
+* **I²C Bus** (PB8=SCL, PB9=SDA):
 
-### Packet Format
+  * BMI088 Accelerometer (0x19)
+  * BMI088 Gyroscope    (0x69)
+  * BMM150 Magnetometer (0x13)
+  * BMP280 Barometer    (0x77)
+  * DS3231 RTC
+* **SD Card**: SPI (`MOSI`, `MISO`, `SCK`), CS = PA4
+* **NAVC → FC**: UART2 on PA3 (TX) / PA2 (RX)
+* **Status LED**: PC13
+
+### Flight Computer (FC) Board
+
+* **LoRa (SX1276)** over SPI:
+
+  * NSS  = PA4
+  * DIO0 = PA8 (IRQ)
+  * NRST = PA9
+  * DIO1 = PA10
+* **Servo PWM**: TIM2 channel 3 → PB10
+* **Buzzer**: PB13 → digital output
+* **NAVC Input**: Serial2 (PA3/PA2)
+* **USB-CDC Debug**: Serial (PA9/PA10 on USB port)
+
+### Ground Station Board
+
+* **LoRa (SX1276)** pins identical to FC
+* **USB-Serial**: Serial (for console I/O)
+
+## Protocols & Buses
+
+| Interface | Purpose                                      |
+| --------- | -------------------------------------------- |
+| **SPI**   | LoRa radio (SX1276) & SD card (NAVC)         |
+| **I²C**   | BMP280, BMI088, BMM150, DS3231 RTC (NAVC)    |
+| **UART1** | GPS → NAVC                                   |
+| **UART2** | NAVC ↔ FC (telemetry frames & commands)      |
+| **LoRa**  | FC ↔ Ground Station (915 MHz, SPI interface) |
+| **PWM**   | Servo control (200 Hz)                       |
+
+## Module Descriptions
+
+### NAVC (`navc/navc.ino`)
+
+The NAVC module samples sensors at regular intervals or on command:
+
+1. **Timestamp (RTC)**: `YYYY-MM-DD HH:MM:SS` from DS3231.
+2. **GPS** (TinyGPSPlus): latitude, longitude, satellites, GPS altitude.
+3. **IMU** (BMI088): accelX, accelY, accelZ \[m/s²]; gyroX, gyroY, gyroZ \[°/s].
+4. **Magnetometer** (BMM150): magX, magY, magZ \[raw units].
+5. **Barometer** (BMP280): temperature \[°C], pressure \[hPa], altitude \[m].
+
+After reading, it builds a CSV packet:
+
 ```
-<YYYY‑MM‑DD HH:MM:SS,
- accelX,accelY,accelZ,
- gyroX,gyroY,gyroZ,
- temp,pressure,altitude,
- magX,magY,magZ,
- gpsLat,gpsLon,satCount,gpsAlt>
+timestamp,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,temp,pressure,altBMP,magX,magY,magZ,lat,lng,sat,altGps
 ```
-- **Comma‑separated**, max length 255 chars  
-- All floats printed with 2 decimal places (angles rounded to integers)  
+
+Packets are framed `< ... >` then:
+
+* Sent to FC over Serial2
+* Logged to `data_log.txt` on SD card
+* Echoed over USB-Serial
+
+#### Data Packet Format
+
+| Pos | Field     | Type   | Units/Format                |
+| --- | --------- | ------ | --------------------------- |
+| 1   | timestamp | String | `YYYY-MM-DD HH:MM:SS`       |
+| 2   | accelX    | float  | m/s²                        |
+| 3   | accelY    | float  | m/s²                        |
+| 4   | accelZ    | float  | m/s²                        |
+| 5   | gyroX     | int    | °/s (rounded)               |
+| 6   | gyroY     | int    | °/s (rounded)               |
+| 7   | gyroZ     | int    | °/s (rounded)               |
+| 8   | temp      | float  | °C                          |
+| 9   | pressure  | float  | hPa                         |
+| 10  | altBMP    | float  | m (relative to 1013.25 hPa) |
+| 11  | magX      | float  | raw                         |
+| 12  | magY      | float  | raw                         |
+| 13  | magZ      | float  | raw                         |
+| 14  | lat       | double | Decimal degrees             |
+| 15  | lng       | double | Decimal degrees             |
+| 16  | sat       | int    | Number of satellites        |
+| 17  | altGps    | float  | m                           |
+
+### Flight Computer (`fc/fc.ino`)
+
+* Buffers incoming `<...>` frames from NAVC on Serial2.
+* For each frame:
+
+  1. Strips `< >`, forwards payload via LoRa to ground.
+  2. Prints payload over USB-Serial.
+  3. Extracts 9th CSV field (BMP280 altitude) and invokes `controlServo()`:
+
+     * Records `launchAltitude` on first positive altitude.
+     * Keeps servo closed until reaching `TARGET_ALTITUDE` (1828.8 m).
+     * Opens servo (PWM duty change) at target, logs event.
+* Listens for LoRa commands from ground:
+
+  * `BUZZER_ON` → activates buzzer on PB13 for 2 s and replies `BUZZER_ON_ACK`.
+
+### Ground Station (`groundstation/groundstation.ino`)
+
+* Initializes LoRa with address 0xA1.
+* Loop:
+
+  1. Checks for incoming LoRa telemetry, prints raw payload on USB.
+  2. Reads USB-Serial for user commands (e.g. `BUZZER_ON`), sends via LoRa to FC.
+
+## Integration with Sentinel
+
+All framed payloads (`<...>`) sent by NAVC → FC → ground station are consumed by **Sentinel**. Sentinel parses the CSV string according to the field map above, converting each entry to its appropriate data type for real-time display, logging, and analysis.
+
+## Usage
+
+1. **Flash** each board with its respective `.ino` file.
+2. **NAVC**: Insert microSD, power on, auto-starts logging and packet emission.
+3. **FC**: Power on, opens USB-Serial at 921600 baud for logs.
+4. **Ground Station**: Connect via USB at 115200 baud, run console, view telemetry, send commands.
 
 ---
 
-## 2. Flight Controller (FC) — `fc/fc.ino`
-
-### Role & Overview
-- **UART listener** on `Serial2` at 115200 baud:
-  - Implements `serialEvent2()` ISR to buffer framed `<…>` packets into a ring buffer
-  - Avoids line‑based reads so it won’t drop frames at high rates
-
-- **LoRa uplink** via SX1276 (`RadioLib`):
-  - Configured at 915 MHz, SF7, BW 250 kHz, CR 4/5, sync word 0xAB
-  - Sends only **payloads** (no brackets) over LoRa after dequeuing each NAVC frame
-  - Prints that payload once to USB‑CDC (`Serial`) for local monitoring
-
-- **Actuation**:
-  - **Servo** on PB10 (TIM2 CH3) stays closed until baro altitude ≥ 1828.8 m, then opens
-  - **Buzzer** on PB13 via LoRa “BUZZER_ON” command and auto‑off after 2 s
-
-### Key Data Flow
-1. **NAVC → FC**  
-   FC calls `Serial2.begin(115200)` and `serialEvent2()` fills `frames[]`
-2. **FC → LoRa**  
-   In `loop()`, on each available frame:  
-   - Strip `< >`  
-   - `radio.transmit(payload, groundStationAddr)`  
-   - `Serial.println(payload)`  
-3. **LoRa → Ground Station**  
-   Uses `SX1276.receive()` in non‑blocking mode
-
----
-
-## 3. Ground Station — `groundstation/groundstation.ino`
-
-### Role & Overview
-- **LoRa receiver** via SX1276:
-  - Same RF settings as FC
-  - On successful `receive()`, prints **raw payload** directly to Serial (no extra formatting)
-
-- **Command uplink**:
-  - Reads any user‑typed line from USB‑CDC (`Serial.readStringUntil('\n')`)
-  - Sends it verbatim over LoRa to FC  
-
----
-
-## Communication Summary
-
-| Link               | Protocol    | Port/Interface | Baud/Freq    | Frame Style          |
-|--------------------|-------------|----------------|--------------|----------------------|
-| NAVC → FC          | UART        | Serial2 (PA3/PA2 on F401)  | 115200 baud | `<CSV…>` frames      |
-| FC → Ground Station| LoRa (SX1276)| SPI + DIO0 etc.| 915 MHz, SF7 | raw CSV payload      |
-| Ground Station → FC| LoRa        | —              | 915 MHz, SF7 | raw command string   |
-
----
-
-### Getting Started
-
-1. **Wire up sensors** on I²C (PB8=SCL, PB9=SDA) and GPS on Serial1.
-2. **Configure SD card** CS on PA4.
-3. **Load** `navc/navc.ino` onto NAVC board.
-4. **Wire** SX1276 to FC (SPI + DIO0/DIO1), load `fc/fc.ino`.
-5. **Wire** SX1276 to Ground Station, load `groundstation/groundstation.ino`.
-6. **Open** USB‑CDC at 921600 baud for FC, 115200 baud for NAVC & GS.
-
-With this setup, NAVC will pump out timestamped telemetry at up to 50 Hz, the FC will reliably forward each packet over LoRa (and actuate servo/buzzer), and the Ground Station will display the live stream.
+*Happy flying!*
